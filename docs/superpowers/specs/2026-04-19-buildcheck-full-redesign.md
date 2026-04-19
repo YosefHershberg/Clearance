@@ -107,13 +107,19 @@ Accepted tradeoff: password reset does NOT force-logout other sessions (the cook
 - Per-IP rate limit on `/api/auth/login`: 10 attempts / 15 min
 - No per-email lockout in v1
 
-### 2.7 File storage — bytes on disk, metadata as entities
+### 2.7 File storage — object storage, metadata as entities
 
-Never store file bytes in Postgres. File bytes go to disk (LOCAL store) with a migration path to S3 (same `StoredFile` row, flipped `store`/`uri`). Supports streams, `sendfile()`, `pg_dump` stays small.
+Never store file bytes in Postgres.
 
-Single `StoredFile` model unifies metadata for DXF/תב"ע/addon docs/renders. Every file-bearing entity owns a 1:1 FK to `StoredFile`.
+**Production:** S3-compatible object storage (Cloudflare R2 recommended — cheap, no egress fees; AWS S3 or any S3-compatible provider works). `StoredFile.store = S3`, `StoredFile.uri = s3://<bucket>/<kind>/<cuid>.<ext>`.
 
-`sha256` is the dedup / "changed?" signal. Re-uploading identical bytes to the same project detects the match (no duplicate row, no duplicate file on disk, no re-extraction).
+**Development:** MinIO in docker-compose (same S3 API, no cloud dependency) OR the `LOCAL` store with `uploads/<kind>/<cuid>.<ext>` on the developer's disk. Both paths exercise the same `storage.client.ts` interface; production tests against MinIO; LOCAL exists for the zero-infra onboarding case.
+
+**`StoredFile` model** unifies metadata across DXF / תב"ע / addon docs / renders. Every file-bearing entity owns a 1:1 FK to `StoredFile`.
+
+**`sha256` is the dedup / "changed?" signal.** Re-uploading identical bytes to the same project detects the match (no duplicate row, no duplicate object in the bucket, no re-extraction).
+
+**Upload path is stream-through, not buffer-then-upload.** Multer receives the multipart body, pipes through a sha256 Transform stream, and feeds `@aws-sdk/lib-storage`'s multi-part `Upload` — the API instance never holds the whole file in memory or on disk. This is the stateless-friendly path and supports up to 100 MB DXFs without flinching.
 
 ### 2.8 Normalization policy
 
@@ -141,13 +147,16 @@ Boot-time recovery: any `Job` stuck in `RUNNING` older than 30 min (or with null
 
 ### 2.12 Python as an HTTP sidecar
 
-Not `execFile('python3 extractor.py ...')` per invocation. A FastAPI service in its own container exposes:
-- `POST /extract` — body: `{ storedFileUri }`, returns `{ rawExtractedData, viewports[], parsedValues[] }`
-- `POST /render` — body: `{ storedFileUri, outputDir }`, returns `{ renders: [{ kind, filename }] }`
+Not `execFile('python3 extractor.py ...')` per invocation. A FastAPI service in its own container/deployment exposes:
+- `POST /extract` — body: `{ sourcePresignedUrl, reqId }`, returns `{ rawExtractedData, viewports[], parsedValues[] }`
+- `POST /render` — body: `{ sourcePresignedUrl, destPresignedPuts: [{ key, putUrl }], reqId }`, returns `{ renders: [{ kind, key, sha256, sizeBytes, viewportBlock? }] }`
+- `GET /health`
 
-Node calls via `fetch` with `X-Request-Id` header. Warm interpreter (~20ms per call vs ~500ms cold-start), canonical UTF-8 over JSON HTTP (surrogate-pair-over-stdout bugs vanish), cancellable via HTTP abort, individually testable.
+Sidecar fetches the DXF bytes from S3 using the presigned GET URL, writes to its own ephemeral `/tmp`, processes, and for renders — uploads each PNG via a pre-provided presigned PUT URL. `/tmp` is wiped per request. No shared volume between Node and the sidecar; both are stateless.
 
-One new compose service, one new port (internal only), one integration adapter (`integrations/python-sidecar.client.ts`). Immediate payback.
+Node calls via `fetch` with `X-Request-Id` header. Warm interpreter (~20 ms per call vs ~500 ms cold-start), canonical UTF-8 over JSON HTTP (surrogate-pair-over-stdout bugs vanish), cancellable via HTTP abort, individually testable, horizontally scalable.
+
+One new deployment, one integration adapter (`integrations/python-sidecar.client.ts`). Immediate payback.
 
 ### 2.13 DXF pipeline efficiency
 
@@ -184,6 +193,65 @@ Authorization: project owner OR admin.
 Per [server/CLAUDE.md](../../../server/CLAUDE.md):
 - Success: `{ data: ... }`
 - Error: `{ error, details? }` (Zod) or `{ message }` (HttpError via the existing handler in [server/src/middlewares.ts](../../../server/src/middlewares.ts))
+
+### 2.19 Stateless servers
+
+The API and the worker are both **fully stateless processes**. Any instance can be killed or replaced at any time with zero user-visible data loss.
+
+**Hard rules (enforced by code review):**
+- No writes to local disk except `/tmp` scratch space (ephemeral per request).
+- No process-memory state shared across requests — rate-limit counters, session data, caches all live in a shared store.
+- JWT session is already stateless (cookie is self-contained + DB lookup per request).
+
+**Infrastructure this implies** (v1 production):
+- **Postgres** — authoritative DB (Prisma Postgres is the v1 default).
+- **S3-compatible object storage** — all file bytes (uploads + renders). Cloudflare R2 recommended.
+- **Redis** — rate-limit counters (`rate-limit-redis`) and, in a later phase, BullMQ.
+- **Python sidecar** — its own deployment, 1-N instances, S3-aware.
+- **API deployment** — N instances behind an LB.
+- **Worker deployment** — 1-N instances, same image as API but entrypoint is `src/worker.ts`.
+
+**Dev infrastructure** (docker-compose): Postgres + Redis + MinIO + Python sidecar + Node API + Node worker. One `docker compose up` boots the whole stack.
+
+**What this explicitly rules out:**
+- Local disk writes for uploads, renders, logs, rate-limit state.
+- Scheduling work in-memory (`setInterval` / `setTimeout` survive a restart? No — put it in the `Job` table).
+- Any `express-session` usage.
+- File transports for winston — all logs go to stdout; platform aggregates.
+
+### 2.20 Chat streaming via SSE
+
+Chat replies stream to the browser as Server-Sent Events (SSE), not as a single JSON blob after 8-10s of silence. Token-by-token rendering matches claude.ai UX and is table stakes for chat.
+
+**Transport:** `POST /api/projects/:id/chat` with `Content-Type: application/json` request and `Accept: text/event-stream` response. Not `GET + EventSource` because we need a request body; not WebSocket because chat is one-directional.
+
+**Event schema** (sent in order):
+```
+event: user-message
+data: {"id":"cuid","content":"...","createdAt":"..."}
+
+event: token
+data: {"text":"שלום"}
+
+event: token
+data: {"text":" עולם"}
+
+...
+
+event: assistant-message
+data: {"id":"cuid","content":"שלום עולם...","createdAt":"..."}
+```
+
+On error: `event: error\ndata: {"message":"..."}` then close. Client `AbortController` closes cleanly on tab-close.
+
+**Server handles streaming without workers/pubsub** — chat is a single synchronous request-scoped operation. The handler:
+1. Persists the `USER` `ChatMessage`, emits `user-message` event.
+2. Calls the Anthropic SDK in streaming mode (`messages.stream(...)`), pipes each content delta into a `token` event.
+3. On stream end, persists the `ASSISTANT` `ChatMessage` with the full content, emits `assistant-message` event, closes the response.
+
+No `Job`, no worker, no Redis pub/sub. SSE is scoped to this one endpoint.
+
+**Analysis-status live updates stay on polling** for v1. Polling at 2.5 s is acceptable for status that changes 4-5 times over 3 minutes. Migrating to SSE for analysis status is §14 open-question material.
 
 ---
 
@@ -700,18 +768,18 @@ Visibility: USER sees own projects (`ownerId === req.user.id AND deletedAt IS NU
 | O    | POST   | `/api/projects/:id/tava`                         | `file` (.pdf)                                | `{ data: { tavaFile } }`   |
 | O    | POST   | `/api/projects/:id/addon-docs`                   | `file` (.pdf), `domain` (form field)         | `{ data: { addonDocument } }`|
 
-Limits: DXF 100 MB, TAVA 50 MB, ADDON 30 MB. Multer disk storage with `decodeOriginalName` (latin1→utf8) helper applied at the middleware level (not per-route).
+Limits: DXF 100 MB, TAVA 50 MB, ADDON 30 MB. Multer uses streaming (not disk or memory storage) via a custom storage engine that pipes directly to S3. `decodeOriginalName` (latin1→utf8) helper applied at the middleware level (not per-route).
 
-Upload behavior:
-1. Multer writes file to `uploads/<kind>/<cuid>.<ext>`
-2. Compute sha256 of the stored file
-3. If any `StoredFile` with same `sha256` AND same `kind` AND already attached to this project (via its file-kind relation) exists → return that existing row (no new StoredFile, no new DxfFile/TavaFile, no extraction re-run)
-4. Otherwise: create `StoredFile` row, create `DxfFile` / `TavaFile` / `AddonDocument` row in a transaction
-5. Enqueue extraction `Job` (DXF_EXTRACTION / TAVA_EXTRACTION / ADDON_EXTRACTION)
-6. Soft-delete any previous current file-of-same-kind on the project (so the new one is "current")
-7. Return the created row with `extractionStatus=PENDING`
+Upload behavior (stateless, stream-through to S3):
+1. Multer receives the multipart body and opens one pipe: `req → sha256 Transform → @aws-sdk/lib-storage Upload` targeting `s3://<bucket>/<kind>/<cuid>.<ext>`. Bytes never land on disk, never buffer fully in Node memory.
+2. When the upload finishes, the sha256 is captured; the `Upload` result gives size.
+3. Dedup check: if any `StoredFile` with same `(sha256, kind)` is already referenced by a `DxfFile` / `TavaFile` / `AddonDocument` on **this project** (including soft-deleted) → abort the just-uploaded S3 object (`DeleteObject`), undelete the existing row if soft-deleted, return it. No new row, no extraction re-run. **Per-project on purpose** — two users with identical bytes get separate `StoredFile` rows.
+4. Otherwise, inside `$transaction`: insert `StoredFile` (kind, store=S3 in prod, uri=`s3://...`, sha256, sizeBytes), insert `DxfFile` / `TavaFile` / `AddonDocument` (extractionStatus=PENDING, storedFileId), soft-delete the project's prior current file-of-same-kind, enqueue the extraction `Job`.
+5. Return the created row with `extractionStatus=PENDING`.
 
 UI polls (§4.5) to see status transitions.
+
+**Failure during upload:** if the stream dies mid-way, `@aws-sdk/lib-storage` aborts the multipart upload and S3 cleans up. No dangling object. No DB row created (nothing committed). Client retries the whole upload.
 
 ### 4.5 Analyses
 
@@ -738,22 +806,39 @@ Each card includes: domain, current `AddonDocument` (if any), latest `AddonRun` 
 
 ### 4.7 Chat
 
-| Auth | Method | Path                                 | Request                 | Response                   |
-|------|--------|--------------------------------------|-------------------------|----------------------------|
-| O    | GET    | `/api/projects/:id/chat`             | query `?limit=&cursor=` | `{ data: { messages, nextCursor } }`|
-| O    | POST   | `/api/projects/:id/chat`             | `{ content }`           | `{ data: { userMessage, assistantMessage } }` |
+| Auth | Method | Path                         | Request                 | Response                            |
+|------|--------|------------------------------|-------------------------|-------------------------------------|
+| O    | GET    | `/api/projects/:id/chat`     | query `?limit=&cursor=` | `{ data: { messages, nextCursor } }`|
+| O    | POST   | `/api/projects/:id/chat`     | `{ content }`           | `text/event-stream` (see §2.20)     |
 
-`POST /chat` is synchronous — the endpoint waits for Claude's response and returns both the persisted user message and the persisted assistant reply. Rate-limited at 5 messages / minute per `(projectId, userId)` to cap Claude spend; independent of source IP so two users on the same network don't collide.
+`POST /chat` is a **streaming** endpoint. Response `Content-Type: text/event-stream`. Events emitted in order: `user-message` (after persisting the user's message), N × `token` (each Claude content-block delta), `assistant-message` (after persisting the assistant's reply), then connection close. On error: `event: error\ndata: {"message":"..."}` then close.
 
-Context built for the assistant: latest `Analysis.summary` + latest 20 `ComplianceResult`s + truncated `TavaFile.rawExtractedText` (first 4000 chars) + truncated viewport summaries. Prior `ChatMessage`s (last 20) included for conversational continuity.
+Rate-limited at 5 messages / minute per `(projectId, userId)` (Redis-backed, §2.19) to cap Claude spend.
+
+Context assembled for the assistant: latest `Analysis.summary` + latest 20 `ComplianceResult`s + truncated `TavaFile.rawExtractedText` (first 4000 chars) + truncated viewport summaries. Prior `ChatMessage`s (last 20) included for conversational continuity.
+
+Headers set on the SSE response:
+```
+Content-Type: text/event-stream
+Cache-Control: no-cache, no-transform
+Connection: keep-alive
+X-Accel-Buffering: no
+```
+Last header tells any downstream nginx/proxy not to buffer.
 
 ### 4.8 Renders
 
-| Auth | Method | Path                                                | Response                  |
-|------|--------|-----------------------------------------------------|---------------------------|
-| P    | GET    | `/api/renders/:dxfFileId/:filename`                 | PNG bytes                 |
+| Auth | Method | Path                                                | Response                          |
+|------|--------|-----------------------------------------------------|-----------------------------------|
+| O    | GET    | `/api/renders/:dxfFileId/:filename`                 | `302` → presigned S3 GET URL      |
 
-Intentionally unauthenticated — the UUID is the capability. Validates cuid format on both params, rejects `..` / `/` / `\` in filename, checks `DxfFile` exists. Must be mounted BEFORE any `app.use('/api', someRouterWithAuth)` that might shadow it (comment in `app.ts` marks this).
+**Change from PRD:** authenticated now (O — owner or admin), because there's no per-object capability layer from S3. The endpoint:
+1. Validates cuid format on `:dxfFileId`, rejects `..` / `/` / `\` in `:filename`.
+2. Finds the `RenderedImage` row joining `DxfFile → Project`; checks owner-or-admin access.
+3. Generates a short-lived (5 min) presigned GET URL for the `StoredFile.uri`.
+4. Returns `302 Location: <presignedUrl>`.
+
+Browser `<img src>` follows the redirect automatically. Node never proxies the bytes — zero egress through the API.
 
 ### 4.9 Health
 
@@ -856,14 +941,18 @@ server/src/
 │   ├── auth.middleware.ts
 │   ├── require-admin.middleware.ts
 │   ├── require-project-access.middleware.ts
-│   ├── upload.middleware.ts             # multer config, decodeOriginalName
+│   ├── upload.middleware.ts             # multer stream-through-to-S3 engine, decodeOriginalName
 │   ├── validate.middleware.ts           # moved from middlewares.ts
 │   ├── error-handler.middleware.ts      # moved
 │   └── not-found.middleware.ts          # moved
-└── bootstrap/
-    ├── seed-admin.ts
-    └── start-job-runner.ts
+├── bootstrap/
+│   ├── seed-admin.ts
+│   └── start-job-runner.ts
+├── index.ts                              # API entrypoint — starts Express only
+└── worker.ts                             # worker entrypoint — starts job runner only
 ```
+
+**Two entrypoints, one codebase.** `index.ts` imports the HTTP stack but does NOT start the worker loop. `worker.ts` imports `jobs/runner.ts` + handlers and starts the loop; it does NOT import Express. Both call the shared bootstrap (env validation, Prisma connect, logger setup). `package.json` scripts: `npm start` → `node dist/index.js`; `npm run worker` → `node dist/worker.js`. Production runs these as two separate deployments.
 
 ### 5.2 Middleware pipeline
 
@@ -893,17 +982,22 @@ hash(plaintext: string): Promise<string>
 compare(plaintext: string, hash: string): Promise<boolean>
 
 // integrations/anthropic.client.ts
-callClaude(opts: { system, user, model: 'opus'|'sonnet', maxTokens }): Promise<{ text, stopReason }>
+callClaude(opts: { system, user, model: 'opus'|'sonnet'|'haiku', maxTokens, reqId }): Promise<{ text, stopReason }>
+streamClaude(opts: { system, user, model, maxTokens, reqId }): AsyncIterable<{ type: 'delta', text } | { type: 'stop', text, stopReason }>
 parseJsonResponse<T>(raw: string): T   // fence-stripping + truncation repair
 
 // integrations/python-sidecar.client.ts
-extractDxf(opts: { storedFileUri, reqId }): Promise<PythonExtractionResult>
-renderDxf(opts: { storedFileUri, outputDir, reqId }): Promise<PythonRenderResult>
+extractDxf(opts: { sourcePresignedUrl, reqId }): Promise<PythonExtractionResult>
+renderDxf(opts: { sourcePresignedUrl, destPresignedPuts: [{ key, putUrl }], reqId }): Promise<PythonRenderResult>
 
-// integrations/storage.client.ts
-saveStream(kind: FileKind, ext: string, stream): Promise<{ uri, sha256, sizeBytes }>
-resolve(uri: string): string             // absolute path for local; presigned URL later for S3
+// integrations/storage.client.ts — S3-first, LOCAL for dev
+uploadStream(kind: FileKind, ext: string, stream): Promise<{ uri, sha256, sizeBytes, key }>
+presignGet(uri: string, ttlSeconds?: number): Promise<string>
+presignPut(kind: FileKind, ext: string): Promise<{ uri, key, putUrl }>
 deleteByUri(uri: string): Promise<void>
+
+// integrations/redis.client.ts
+redis: IORedis                            // shared instance; used by rate-limit-redis
 ```
 
 ### 5.4 Types
@@ -924,9 +1018,49 @@ interface Request {
 - `jsonwebtoken` + `@types/jsonwebtoken`
 - `cookie-parser` + `@types/cookie-parser`
 - `multer` + `@types/multer`
+- `@aws-sdk/client-s3`, `@aws-sdk/lib-storage`, `@aws-sdk/s3-request-presigner`
+- `ioredis`
+- `rate-limit-redis`
 - `@anthropic-ai/sdk`
 - `cuid` (already implicit via Prisma)
-- No `bullmq` — deferred (Job table is enough)
+- No `bullmq` — deferred (Job table is enough for v1)
+
+### 5.6 Environment variables (added to [server/src/utils/env.ts](../../../server/src/utils/env.ts))
+
+All validated at boot with Zod; server exits on missing/invalid.
+
+```
+# Existing
+PORT
+DATABASE_URL
+DIRECT_URL
+CORS_ORIGIN
+
+# Auth
+JWT_SECRET                     # ≥32 chars
+ADMIN_EMAIL                    # valid email
+ADMIN_INITIAL_PASSWORD         # ≥8 chars
+
+# Object storage
+S3_ENDPOINT                    # e.g. https://<account>.r2.cloudflarestorage.com
+S3_REGION                      # e.g. auto (R2) or us-east-1 (S3)
+S3_ACCESS_KEY_ID
+S3_SECRET_ACCESS_KEY
+S3_BUCKET
+S3_FORCE_PATH_STYLE            # "true" for MinIO/R2-path-style, "false" for AWS
+
+# Redis
+REDIS_URL                      # e.g. redis://default:pw@host:6379
+
+# Python sidecar
+PYTHON_SIDECAR_URL             # e.g. http://python-sidecar:5000
+
+# Anthropic
+ANTHROPIC_API_KEY
+
+# Local dev only — ignored in prod
+STORAGE_BACKEND                # "S3" | "LOCAL", default "S3"
+```
 
 ---
 
@@ -953,7 +1087,7 @@ client/src/
 │   ├── uploads.api.ts
 │   ├── analyses.api.ts
 │   ├── addon-runs.api.ts
-│   └── chat.api.ts
+│   └── chat.api.ts                     # fetch-with-stream for POST /chat (SSE parser)
 ├── hooks/
 │   ├── useAuth.ts
 │   ├── useAdminUsers.ts
@@ -962,7 +1096,7 @@ client/src/
 │   ├── useUploads.ts
 │   ├── useAnalysis.ts                  # polling hook
 │   ├── useAddonRuns.ts
-│   └── useChat.ts
+│   └── useChat.ts                       # streaming mutation: optimistic user msg, append token-by-token
 ├── components/
 │   ├── layout/
 │   │   ├── AppShell.tsx
@@ -1063,61 +1197,69 @@ Every request forwards `X-Request-Id` from Node's `req.id` into the sidecar's lo
 - ASCII-only text filter (Hebrew labels skipped)
 - Writes PNGs to `outputDir`, returns filenames
 
-### 7.2 Node-side DXF upload flow
+### 7.2 Node-side DXF upload flow (stream-through to S3)
 
 `POST /api/projects/:id/dxf`:
-1. Multer stream → `uploads/dxf/<cuid>.dxf`
-2. Stream sha256 during write (piggyback on the stream, no re-read)
-3. **Dedup check:** if a `StoredFile` with same `(sha256, kind=DXF)` already exists AND is referenced by a `DxfFile` on **this project** (including soft-deleted ones) → return that `DxfFile` (undelete if soft-deleted), delete the just-written file from disk, no extraction job enqueued. **Dedup is per-project on purpose** — cross-project sharing of the same bytes creates separate `StoredFile` rows, because two users uploading identical files should not share file-level authorization
-4. Otherwise, inside `$transaction`:
-   - Create `StoredFile`
-   - Create `DxfFile` with `extractionStatus=PENDING`, `storedFileId` set, `projectId` set
-   - Soft-delete prior current `DxfFile` on project (if any) — the new one is now current
+1. Multer custom engine pipes the multipart body through a sha256 Transform into `@aws-sdk/lib-storage::Upload` targeting `s3://<bucket>/dxf/<cuid>.dxf`. Neither disk nor full memory buffering; sha256 falls out of the same pipe.
+2. **Dedup check:** if a `StoredFile` with same `(sha256, kind=DXF)` already exists AND is referenced by a `DxfFile` on **this project** (including soft-deleted) → `DeleteObject` the just-uploaded S3 object, undelete the existing row if soft-deleted, return it. No new DB row. Per-project on purpose (§4.4).
+3. Otherwise, inside `$transaction`:
+   - Insert `StoredFile` (kind=DXF, store=S3, uri=`s3://...`, sha256, sizeBytes)
+   - Insert `DxfFile` with `extractionStatus=PENDING`, `storedFileId`, `projectId`
+   - Soft-delete prior current `DxfFile` on project (if any)
    - Enqueue `Job { type: DXF_EXTRACTION, dxfFileId }`
-5. Return created row (UI polls for extraction completion)
+4. Return created row (UI polls for extraction completion).
 
 ### 7.3 DXF_EXTRACTION job handler
 
-1. Set `Job.status=RUNNING`, `startedAt=now`, `heartbeatAt=now`; update `DxfFile.extractionStatus=EXTRACTING`
-2. `POST http://python-sidecar:5000/extract` with `{ storedFileUri: storedFile.uri, reqId }`
-3. On failure: `Job.status=FAILED`, `DxfFile.extractionStatus=FAILED`, `extractionError=<message>`, audit `dxf.extraction.failed`, return
-4. On success, inside `$transaction`:
-   - Update `DxfFile.rawExtractedData=<raw>`, `extractionStatus=COMPLETED`
-   - `createMany` `Viewport` rows
-   - `createMany` `ParsedValue` rows
-5. Enqueue `Job { type: DXF_RENDER, dxfFileId }` (best-effort; not awaited)
-6. `Job.status=COMPLETED`, `completedAt=now`
+Runs in the **worker** process, not the API:
+
+1. Transition `Job.status=RUNNING` + bump `DxfFile.extractionStatus=EXTRACTING`; `heartbeatAt=now`.
+2. Generate a short-lived presigned GET URL for the `StoredFile.uri` (TTL 10 min — enough for the sidecar to fetch).
+3. `POST <PYTHON_SIDECAR_URL>/extract` with `{ sourcePresignedUrl, reqId }` and a 60s timeout.
+4. Sidecar downloads via the presigned URL to its `/tmp`, runs ezdxf, returns `{ rawExtractedData, viewports[], parsedValues[] }`.
+5. On failure: `Job.status=FAILED`, `DxfFile.extractionStatus=FAILED`, `extractionError`, audit `dxf.extraction.failed`.
+6. On success, inside `$transaction`:
+   - `DxfFile.rawExtractedData=<raw>`, `extractionStatus=COMPLETED`
+   - Bulk-insert `Viewport` rows with pre-generated cuid ids (so `ParsedValue` rows know the FK)
+   - Bulk-insert `ParsedValue` rows
+7. Enqueue `Job { type: DXF_RENDER, dxfFileId }` (best-effort, not awaited).
+8. `Job.status=COMPLETED`.
 
 ### 7.4 DXF_RENDER job handler
 
-1. `POST http://python-sidecar:5000/render` with `{ storedFileUri, outputDir: "uploads/renders/<dxfFileId>" }`
-2. On failure: log error, mark Job FAILED, but DO NOT propagate — rendering failures never affect analysis (§2.13)
-3. On success, for each render returned:
-   - Create `StoredFile` row (kind=RENDER, uri=`uploads/renders/<dxfFileId>/<filename>`, compute sha256 + sizeBytes)
-   - Create `RenderedImage` row linking `DxfFile` to new `StoredFile`
-4. `Job.status=COMPLETED`
+1. Fetch `DxfFile.storedFile`.
+2. Generate a source presigned GET URL (10 min TTL).
+3. Pre-provision up to N presigned PUT URLs (one per expected render — the sidecar tells us in practice, so we over-provision to N=10 to be safe) for keys `renders/<dxfFileId>/<renderCuid>.png`.
+4. `POST <PYTHON_SIDECAR_URL>/render` with `{ sourcePresignedUrl, destPresignedPuts, reqId }`. 120s timeout.
+5. Sidecar renders matplotlib PNGs locally, then `PUT` each via its presigned URL. Returns `{ renders: [{ kind, key, sha256, sizeBytes, viewportBlock? }] }`.
+6. On failure: log, mark `Job.status=FAILED` — but DO NOT propagate (renders never block analysis, §2.13).
+7. On success, inside `$transaction`, for each returned render: insert `StoredFile` (kind=RENDER, uri=`s3://<bucket>/<key>`, sha256 echoed from sidecar) + `RenderedImage` row.
+8. `Job.status=COMPLETED`.
 
 ### 7.5 DXF pipeline efficiency recap
 
-- **No re-extraction** on re-upload of identical bytes (dedup via sha256)
-- **No re-extraction** across analysis re-runs (raw + normalized tables cached)
-- **No blocking renders** (render is its own best-effort job)
-- **Bulk-insert normalized rows** via Prisma `createMany` (hundreds of rows per upload, one round-trip)
-- **Warm Python** via sidecar (no ~500ms cold-start per call)
-- **Canonical UTF-8** via JSON HTTP body (surrogate-pair stdout bugs eliminated)
+- **Stateless end-to-end.** Neither API nor sidecar persists anything to local disk beyond `/tmp`.
+- **No re-upload** on re-upload of identical bytes (sha256 dedup), no re-extraction either.
+- **No re-extraction** across analysis re-runs (normalized tables cached).
+- **No blocking renders** (own best-effort job, failure is absorbed).
+- **Bulk-insert normalized rows** via Prisma `createMany` (hundreds of rows per upload, one round-trip per table).
+- **Warm Python** via sidecar (no ~500 ms cold-start per call).
+- **Canonical UTF-8** via JSON HTTP body (surrogate-pair stdout bugs eliminated).
+- **Zero egress through Node** on reads — render endpoint redirects to a presigned S3 URL.
 
 ---
 
 ## 8. PDF / OCR Pipeline (תב"ע + add-on docs)
 
-Runs inside the Node container (no sidecar needed — `pdftotext` and `tesseract` are CLI tools invoked via `execFile`).
+Runs inside the **worker** process (`pdftotext` and `tesseract` are system binaries in the worker image). The worker fetches the PDF bytes from S3 into its ephemeral `/tmp`, processes, then discards.
 
 ### 8.1 Flow (TAVA_EXTRACTION / ADDON_EXTRACTION job)
 
-1. `execFile('pdftotext', ['-layout', storedFile.uri, '-'])`, capture stdout
+0. Download `StoredFile` bytes from S3 into `/tmp/<jobId>.pdf` (via presigned GET URL + `https` stream to file). After the job returns, the tmp file is deleted.
+1. `execFile('pdftotext', ['-layout', tmpPath, '-'])`, capture stdout
 2. If `stdout.trim().length > 100` → treat as digital PDF, `extractionMethod=PDF_TEXT`, raw text = stdout
 3. Else → OCR fallback:
-   - `execFile('pdftoppm', ['-tiff', '-r', '300', storedFile.uri, tmpBase])` — render all pages to 300 DPI TIFFs
+   - `execFile('pdftoppm', ['-tiff', '-r', '300', tmpPath, tmpBase])` — render all pages to 300 DPI TIFFs in `/tmp`
    - For each TIFF in parallel (concurrency=4): `execFile('tesseract', [tif, '-', '-l', 'heb+eng', '--psm', '1'])`
    - Prefix each page with `--- עמוד N ---`, concatenate
    - `extractionMethod=TESSERACT_OCR`
@@ -1188,27 +1330,34 @@ Base class:
 6. Parse + bulk-insert `ComplianceResult` with `addonRunId` set
 7. Aggregate counts into `AddonRun`, `status=COMPLETED`
 
-### 9.3 Chat agent (per-project)
+### 9.3 Chat agent (per-project, streaming via SSE)
 
-`chat.service.ts::respond(projectId, userContent)`:
-1. Persist `ChatMessage { role: USER, content: userContent }`
-2. Assemble context:
-   - Last 20 `ChatMessage`s (conversational continuity)
-   - Latest `Analysis.summary` + latest 20 `ComplianceResult`s (across core + add-on runs if available)
+`chat.controller.ts` holds the SSE response open; `chat.service.ts::respond(projectId, userContent, res)` drives it:
+
+1. Inside a transaction: persist `ChatMessage { role: USER, content: userContent }`. Emit SSE `user-message` event with the persisted row.
+2. Assemble context (same shape as before):
+   - Last 20 `ChatMessage`s (conversational continuity, excluding the one just inserted)
+   - Latest `Analysis.summary` + latest 20 `ComplianceResult`s across core + add-on runs
    - Latest `TavaFile.rawExtractedText` truncated to 4000 chars
    - Latest `DxfFile` viewport summary (same builder as §9.1)
-3. `callClaude({ model: 'opus', maxTokens: 4000 })` — shorter cap than analysis since replies are conversational
-4. Persist `ChatMessage { role: ASSISTANT, content: reply }`
-5. Return both messages
+3. `streamClaude({ model: 'opus', maxTokens: 4000, reqId, ... })` — consumes Anthropic SDK's streaming API.
+4. For each `{ type: 'delta', text }` yielded by the stream: append to a running buffer AND emit SSE `token` event with `{ text }`.
+5. On `{ type: 'stop', text, stopReason }`:
+   - Persist `ChatMessage { role: ASSISTANT, content: text }` in a transaction.
+   - Emit SSE `assistant-message` event with the persisted row.
+   - End the response.
+6. On any error mid-stream: emit SSE `event: error` with a safe message (no stack), then end the response. The partial assistant reply is NOT persisted (avoids half-garbled history).
+7. Client-side disconnect (`req` emits `close`): the stream is aborted via `AbortController`; the controller logs `chat.aborted` and the partial reply is NOT persisted. User re-asks.
 
-Synchronous response (2-10 s latency). Acceptable for a focused Q&A surface; WebSocket streaming deferred.
+Typical total time: 3-8 s, but the first token arrives in ~300 ms. User perception is "instant."
 
 ### 9.4 Anthropic client details
 
 `integrations/anthropic.client.ts` single choke point:
 - One `Anthropic` instance from `@anthropic-ai/sdk`
-- Single `callClaude` function takes `{ system, user, model: 'opus'|'sonnet'|'haiku', maxTokens, reqId }`
-- Maps `model` shorthand → exact model IDs: `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001` (latest as of 2026-04-19)
+- `callClaude({ system, user, model, maxTokens, reqId })` — non-streaming, returns `{ text, stopReason, inputTokens, outputTokens }`
+- `streamClaude({ system, user, model, maxTokens, reqId, signal? })` — async-iterable yielding deltas then a final stop event
+- Model shorthand → exact IDs: `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001` (as of 2026-04-19)
 - Logs `{ reqId, model, inputTokens, outputTokens, ms, stopReason }` at info level
 - Warn-log when `stopReason === 'max_tokens'`
 - `parseJsonResponse<T>` exported alongside
@@ -1228,7 +1377,7 @@ interface JobRunner {
 }
 ```
 
-v1 implementation: DB-polling worker. Single Node process runs the loop.
+v1 implementation: DB-polling worker running as a **separate deployment** (`src/worker.ts` entrypoint). API processes DO NOT run the loop. Scale API and worker independently.
 
 ### 10.2 Worker loop
 
@@ -1248,7 +1397,7 @@ every 2s:
     // no automatic retry in v1; manual re-enqueue via admin UI later
 ```
 
-`FOR UPDATE SKIP LOCKED` means multiple worker instances are safe if ever added. Heartbeat update every 30s during long handlers so the boot-time reaper knows the job is alive.
+`FOR UPDATE SKIP LOCKED` makes N worker instances safe. Scale horizontally by running more `worker.ts` processes against the same DB. Heartbeat update every 30 s during long handlers so the boot-time reaper knows the job is alive.
 
 ### 10.3 Handlers
 
@@ -1256,11 +1405,13 @@ One per `JobType` (see §5.1). Each handler receives the full `Job` row and does
 
 ### 10.4 Boot-time recovery
 
-`bootstrap/start-job-runner.ts` before `app.listen()`:
+`bootstrap/start-job-runner.ts` called from `src/worker.ts` before the worker loop starts:
 1. `UPDATE Job SET status='FAILED', errorMessage='interrupted by server restart', completedAt=now WHERE status='RUNNING' AND (heartbeatAt IS NULL OR heartbeatAt < now - interval '30 seconds')`
 2. `UPDATE Analysis SET status='FAILED', errorMessage='interrupted by server restart', completedAt=now WHERE status IN ('PENDING','ANALYZING') AND createdAt < now - interval '30 minutes'`
 3. Same for `AddonRun`
 4. Start the worker loop
+
+The API process does NOT run this recovery (it's not managing jobs). Running it on both would race — leave it exclusively to workers. If you scale to 0 workers temporarily, stuck rows don't get reaped until a worker comes back; that's fine.
 
 ### 10.5 Swapping to BullMQ later
 
@@ -1366,9 +1517,11 @@ Feeds the `writing-plans` skill. Each phase is a reviewable checkpoint; each pro
 **Phase 0 — Foundations (scaffolding, no feature logic).**
 - `requestId` middleware, `cookieParser`, CORS `credentials: true`
 - Split `middlewares.ts` → `middlewares/` folder
-- `integrations/` folder skeleton with `auth-cookie.ts` + `password.ts`
-- Env vars added to [server/src/utils/env.ts](../../../server/src/utils/env.ts): `JWT_SECRET`, `ADMIN_EMAIL`, `ADMIN_INITIAL_PASSWORD`
-- Docker Compose / Prisma Postgres (whichever user picks) connected
+- `integrations/` folder skeleton with `auth-cookie.ts` + `password.ts` + `redis.client.ts`
+- Env vars added to [server/src/utils/env.ts](../../../server/src/utils/env.ts) per §5.6 (auth + S3 + Redis + Python sidecar + Anthropic)
+- `docker-compose.yml` at repo root: Postgres + Redis + MinIO + Python sidecar + Node API + Node worker
+- Redis-backed `rate-limit-redis` wiring (global limiter + login-specific limiter)
+- `src/worker.ts` entrypoint skeleton (runs nothing useful yet, just confirms it boots)
 
 **Phase 1 — Auth + roles.**
 - Prisma models: `User`, `AuditLog`; first migration
@@ -1377,37 +1530,41 @@ Feeds the `writing-plans` skill. Each phase is a reviewable checkpoint; each pro
 - Admin routes (list, create, delete, reset-password, active toggle, stats) + tests
 - Client: login page, auth state hook, protected route, admin users page
 
-**Phase 2 — Projects + storage.**
+**Phase 2 — Projects + S3 storage.**
 - Prisma models: `StoredFile`, `Project`; migration
-- `integrations/storage.client.ts` (local disk only)
+- `integrations/storage.client.ts` — S3 implementation via `@aws-sdk/client-s3` + `@aws-sdk/lib-storage`; LOCAL fallback for `STORAGE_BACKEND=LOCAL`
+- Integration tests run against MinIO in docker-compose
 - Project CRUD endpoints + tests
 - Client: project list (HomePage), create-project page, project detail page
 
-**Phase 3 — Jobs infrastructure.**
+**Phase 3 — Jobs infrastructure + worker deployment.**
 - Prisma model: `Job`; migration
-- `jobs/runner.ts` + worker loop + `bootstrap/start-job-runner.ts`
-- `jobs/recovery.ts` + integration test for boot recovery
+- `jobs/runner.ts` + worker loop
+- `bootstrap/start-job-runner.ts` + boot recovery
+- `src/worker.ts` starts the loop; `src/index.ts` does NOT
+- Integration test: spin up API-only and worker-only processes, confirm jobs flow
 - No handlers yet
 
 **Phase 4 — DXF upload + extraction + render.**
 - Prisma models: `DxfFile`, `Viewport`, `ParsedValue`, `RenderedImage`; migration
-- Python sidecar container + FastAPI app + `/extract`, `/render`, `/health`
-- `integrations/python-sidecar.client.ts`
-- Upload endpoint + multer + `decodeOriginalName` + sha256 dedup
+- Python sidecar Dockerfile + FastAPI app + `/extract`, `/render`, `/health` — S3-aware (boto3 fetches via presigned GET, uploads via presigned PUT)
+- `integrations/python-sidecar.client.ts` — passes presigned URLs
+- `middlewares/upload.middleware.ts` — custom multer storage engine that streams to S3 with sha256 Transform
+- Upload endpoint + `decodeOriginalName` + sha256 dedup (with S3 `DeleteObject` on dedup-hit)
 - Handlers: `dxf-extraction.handler.ts`, `dxf-render.handler.ts`
-- Renders route + tests
+- Renders route: 302 redirect to presigned GET URL
 - Client: DXF upload in project page, DxfPreview grid + lightbox
 
 **Phase 5 — TAVA upload + OCR + requirements.**
 - Prisma models: `TavaFile`, `TavaPage`, `Requirement`; migration
-- `services/tava-extraction.service.ts` (pdftotext + tesseract parallel)
+- `services/tava-extraction.service.ts` — download from S3 to `/tmp`, `pdftotext` + `tesseract` parallel, delete `/tmp` file
 - `parseTavaRequirements` via `integrations/anthropic.client.ts`
 - Handler: `tava-extraction.handler.ts`
 - Client: TAVA upload in project page
 
 **Phase 6 — Core compliance agent.**
 - Prisma models: `Analysis`, `ComplianceResult`; migration
-- `compliance-agent.service.ts::buildCorePrompt`
+- `compliance-agent.service.ts::buildCorePrompt` (reads normalized tables, NOT the raw JSON)
 - `core-analysis.service.ts` + handler
 - Analyze endpoint + analysis-status polling
 - Client: AnalysisPage with results + score + thumbnails
@@ -1418,17 +1575,18 @@ Feeds the `writing-plans` skill. Each phase is a reviewable checkpoint; each pro
 - Upload + run endpoints
 - Client: AddonAgentCard × 4
 
-**Phase 8 — Chat.**
+**Phase 8 — Chat with SSE streaming.**
 - Prisma model: `ChatMessage`; migration
-- `chat.service.ts`
-- Chat endpoints
-- Client: ChatPanel on AnalysisPage (or ProjectPage — pick when implementing)
+- `chat.service.ts` with `streamClaude` integration
+- `POST /api/projects/:id/chat` as SSE endpoint; `GET` as history
+- Client: `chat.api.ts` with streaming parser (fetch + ReadableStream), `useChat.ts` optimistic hook, `ChatPanel.tsx` with token-by-token rendering
+- Abort on unmount / tab close
 
 **Phase 9 — Polish + docs.**
 - Hebrew UI copy review
 - All vault pages written/updated
 - Playwright smoke
-- Final docker-compose.prod.yml, deploy script, host nginx template
+- `docker-compose.prod.yml` example, deploy script, reverse-proxy template
 
 **Phase 10 — One-shot build prompt.**
 - Final deliverable: a self-contained prompt that rebuilds the entire app from scratch. Lives at `docs/superpowers/prompts/build-from-scratch.md`.
@@ -1445,15 +1603,16 @@ Captured so nothing is lost. None block v1.
 4. Token-version column for forced-logout-on-password-reset
 5. Refresh-token flow
 6. Shared-schema package between client and server
-7. S3 storage implementation
+7. Direct-to-S3 client uploads (two-phase presigned PUT) — replaces proxy uploads if bandwidth warrants
 8. pgvector / RAG for chat (pull in past similar analyses)
-9. BullMQ swap (requires Redis)
-10. 3D DXF entity support
-11. DWG file support (client-side export step in UI)
-12. WebSocket streaming for chat replies
-13. Periodic cleanup job for orphan files on disk
+9. BullMQ swap (Redis is already provisioned by §2.19)
+10. SSE for analysis-status live updates (replaces 2.5s polling)
+11. 3D DXF entity support
+12. DWG file support (client-side export step in UI)
+13. Periodic cleanup job for orphan S3 objects (rows deleted but object left behind, or vice versa)
 14. Metrics / tracing backend (Prometheus, OTEL)
 15. Rate limits on analyze endpoint (Claude spend cap)
+16. CDN in front of the renders endpoint (currently Node generates presigned URLs per request)
 
 ---
 
