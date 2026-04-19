@@ -6,21 +6,15 @@ tags:
   - flow
   - auth
 source:
-  - server/src/middlewares.ts
+  - server/src/api/routes/auth.routes.ts
+  - server/src/middlewares/auth.middleware.ts
 ---
 
 # Authentication Flow
 
-> [!info] Not implemented
-> Authentication has been removed from the server. No auth middleware is currently applied to `/api/*` routes. This note is a placeholder for when a new auth strategy is chosen and implemented.
+Superseded by two more focused pages:
 
-## Previous state
+- [[Login and Session]] — session lifecycle (login → /me → logout), cookie policy, sequence diagram
+- [[Auth - Middleware Chain]] — per-request validation (token → user → active check), request augmentation with `req.user`
 
-The server previously used Supabase Auth (JWT verification via service-role key). This was removed before any domain routes existed.
-
-## When re-implementing
-
-- Choose an auth strategy and document it here
-- Create an auth middleware in `server/src/middlewares.ts`
-- Mount it on `/api/*` in `server/src/app.ts`
-- Update [[Client-Server Boundary]] and [[Server MOC]]
+See also: [[Auth - Login Flow]], [[Auth - Admin Seeder]], [[Admin Creates User]].
