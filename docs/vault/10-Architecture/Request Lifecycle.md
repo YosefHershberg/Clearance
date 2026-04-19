@@ -15,7 +15,7 @@ source:
 Order of middleware as wired in [server/src/app.ts:14](../../../server/src/app.ts):
 
 1. `app.set('trust proxy', 1)` — needed for [[Rate Limiter]] behind a proxy
-2. [[requestId]] — generates a cuid, sets `req.id` and `X-Request-Id` response header
+2. [[requestId]] — generates a UUID v4, sets `req.id` and `X-Request-Id` response header
 3. `morgan('dev')` — request logger
 4. `helmet()` — security headers
 5. `cors({ origin: env.CORS_ORIGIN, credentials: true })` — see [[Client-Server Boundary]]
