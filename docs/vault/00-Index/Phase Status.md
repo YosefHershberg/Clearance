@@ -7,7 +7,7 @@ tags:
   - buildcheck
 project: buildcheck
 current_phase: 3
-current_status: in-progress
+current_status: in-review
 integration_branch: integration/buildcheck
 spec: docs/superpowers/specs/2026-04-20-buildcheck-phase-3-jobs-infrastructure-design.md
 updated: 2026-04-20
@@ -16,7 +16,7 @@ updated: 2026-04-20
 # BuildCheck — Phase Status
 
 > [!info] Current
-> **Phase 3 — Jobs infrastructure** · status **in-progress** · branch `feat/buildcheck-phase-3` (stacked on phase-2) · [[../../superpowers/specs/2026-04-20-buildcheck-phase-3-jobs-infrastructure-design|design spec]]
+> **Phase 3 — Jobs infrastructure** · status **in-review** · branch `feat/buildcheck-phase-3` (stacked on phase-2) · [server#4](https://github.com/YosefHershberg/Clearance-server/pull/4) · [[../../superpowers/specs/2026-04-20-buildcheck-phase-3-jobs-infrastructure-design|design spec]]
 >
 > **Phase 2** remains **in-review** — [Clearance#4](https://github.com/YosefHershberg/Clearance/pull/4) + [server#3](https://github.com/YosefHershberg/Clearance-server/pull/3) + [client#2](https://github.com/YosefHershberg/Clearance-client/pull/2)
 >
@@ -47,7 +47,7 @@ Single source of truth for where the BuildCheck redesign is right now. Check thi
 | 1a | Auth + admin (server) | merged | `feat/buildcheck-phase-1a` | [Clearance#2](https://github.com/YosefHershberg/Clearance/pull/2) | merged 2026-04-19; User + AuditLog, seed-admin, auth + admin routes, tests |
 | 1b | Auth UI (client) | **in-review** | `feat/buildcheck-phase-1b` | [Clearance#3](https://github.com/YosefHershberg/Clearance/pull/3) · [client#1](https://github.com/YosefHershberg/Clearance-client/pull/1) | login page, auth state hook, protected route wrapper, admin users page; design: [2026-04-20-buildcheck-phase-1b-client-auth-design.md](../../superpowers/specs/2026-04-20-buildcheck-phase-1b-client-auth-design.md) |
 | 2 | Projects + storage | **in-review** | `feat/buildcheck-phase-2` | [server#3](https://github.com/YosefHershberg/Clearance-server/pull/3) · [client#2](https://github.com/YosefHershberg/Clearance-client/pull/2) | `StoredFile`, `Project`, local-disk storage, project CRUD, client project pages; design: [2026-04-20-buildcheck-phase-2-projects-storage-design.md](../../superpowers/specs/2026-04-20-buildcheck-phase-2-projects-storage-design.md) |
-| 3 | Jobs infrastructure | **in-progress** | `feat/buildcheck-phase-3` | — | `Job`, runner + recovery, no handlers yet; design: [2026-04-20-buildcheck-phase-3-jobs-infrastructure-design.md](../../superpowers/specs/2026-04-20-buildcheck-phase-3-jobs-infrastructure-design.md) |
+| 3 | Jobs infrastructure | **in-review** | `feat/buildcheck-phase-3` | [server#4](https://github.com/YosefHershberg/Clearance-server/pull/4) | `Job`, runner + recovery, no handlers yet; design: [2026-04-20-buildcheck-phase-3-jobs-infrastructure-design.md](../../superpowers/specs/2026-04-20-buildcheck-phase-3-jobs-infrastructure-design.md) |
 | 4a | Sidecar + upload + explore | planned | — | — | FastAPI sidecar skeleton, `/explore` only, upload endpoint, per-project sha256 dedup, `DxfFile.explorationJson` + `structuralHash` |
 | 4b | Codegen + execute + self-correct | planned | — | — | Sidecar `/execute`, Claude Opus codegen + fix prompts, `ExtractionScript` cache (global, append-only), state-machine handler, `DxfFile.complianceData` populated |
 | 4c | SheetRender persistence + client viewer | planned | — | — | `SheetRender` table, SVG serving endpoint, DxfPreview grid + lightbox; cross-architect acceptance test |
