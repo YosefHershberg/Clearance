@@ -24,6 +24,7 @@ Knowledge graph for the Clearance fullstack app. Two submodules: a React/Vite cl
 
 ## Quick links
 
+- [[Phase Status]] — where the BuildCheck redesign is right now
 - [[System Overview]]
 - [[Client-Server Boundary]]
 - [[Request Lifecycle]]
@@ -32,4 +33,4 @@ Knowledge graph for the Clearance fullstack app. Two submodules: a React/Vite cl
 
 ## Tags
 
-`#client` `#server` `#api` `#auth` `#db` `#config`
+`#client` `#server` `#api` `#auth` `#db` `#config` `#ci-cd`
