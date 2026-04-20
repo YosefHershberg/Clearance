@@ -17,3 +17,11 @@ An Obsidian knowledge graph lives at `docs/vault/`. Use it as the first stop for
 - Start at `docs/vault/00-Index/Home.md` (MOCs for Architecture, Client, Server, API, Data, Flows)
 - When changing behavior, update the relevant vault page in the same PR
 - Use the `obsidian:obsidian-markdown` skill for wikilinks/callouts/frontmatter and `obsidian:obsidian-cli` for vault queries
+
+## Active redesign: BuildCheck
+A ground-up redesign of the app is in progress, broken into ~10 phases. Always start by checking current phase state before proposing work.
+
+- **Current phase + status:** `docs/vault/00-Index/Phase Status.md` — single source of truth; check first, update on every transition
+- **Spec:** `docs/superpowers/specs/2026-04-19-buildcheck-full-redesign.md` (§13 = phase breakdown)
+- **Branch strategy:** long-lived `integration/buildcheck` off `main`; each phase ships via `feat/buildcheck-phase-N → integration/buildcheck` (per-phase CI + review gate). A single final PR merges integration → `main` at v1. Never commit directly to the integration branch; submodule bumps ride along with the phase PR.
+- **When a phase transitions** (branch created, PR opened, PR merged, next phase picked up): update `Phase Status.md` in the same commit.
