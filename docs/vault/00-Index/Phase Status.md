@@ -6,17 +6,19 @@ tags:
   - status
   - buildcheck
 project: buildcheck
-current_phase: 1b
-current_status: in-review
+current_phase: 2
+current_status: in-progress
 integration_branch: integration/buildcheck
-spec: docs/superpowers/specs/2026-04-20-buildcheck-phase-1b-client-auth-design.md
+spec: docs/superpowers/specs/2026-04-20-buildcheck-phase-2-projects-storage-design.md
 updated: 2026-04-20
 ---
 
 # BuildCheck — Phase Status
 
 > [!info] Current
-> **Phase 1b — Client auth UI** · status **in-review** · branch `feat/buildcheck-phase-1b` · [Clearance#3](https://github.com/YosefHershberg/Clearance/pull/3) + [Clearance-client#1](https://github.com/YosefHershberg/Clearance-client/pull/1) · [[../../superpowers/specs/2026-04-20-buildcheck-phase-1b-client-auth-design|design spec]]
+> **Phase 2 — Projects + storage** · status **in-progress** · branch `feat/buildcheck-phase-2` (stacked on phase-1b) · [[../../superpowers/specs/2026-04-20-buildcheck-phase-2-projects-storage-design|design spec]]
+>
+> **Phase 1b** remains **in-review** — [Clearance#3](https://github.com/YosefHershberg/Clearance/pull/3) + [Clearance-client#1](https://github.com/YosefHershberg/Clearance-client/pull/1)
 
 > [!note] 2026-04-20 — Phase 4 split
 > The spec's DXF pipeline was revised to the v3 AI-generated-extraction architecture. Phase 4 is now delivered as three sub-phases: **4a** (sidecar + upload + explore), **4b** (codegen + execute + self-correct), **4c** (SheetRender persistence + client viewer). Phase numbering for 5–10 is unchanged. See the spec's revision note at the top of `2026-04-19-buildcheck-full-redesign.md`.
@@ -42,7 +44,7 @@ Single source of truth for where the BuildCheck redesign is right now. Check thi
 | 0 | Foundations | merged | — | — | requestId middleware, cookieParser, CORS credentials, middlewares split, env vars, DB wiring |
 | 1a | Auth + admin (server) | merged | `feat/buildcheck-phase-1a` | [Clearance#2](https://github.com/YosefHershberg/Clearance/pull/2) | merged 2026-04-19; User + AuditLog, seed-admin, auth + admin routes, tests |
 | 1b | Auth UI (client) | **in-review** | `feat/buildcheck-phase-1b` | [Clearance#3](https://github.com/YosefHershberg/Clearance/pull/3) · [client#1](https://github.com/YosefHershberg/Clearance-client/pull/1) | login page, auth state hook, protected route wrapper, admin users page; design: [2026-04-20-buildcheck-phase-1b-client-auth-design.md](../../superpowers/specs/2026-04-20-buildcheck-phase-1b-client-auth-design.md) |
-| 2 | Projects + storage | planned | — | — | `StoredFile`, `Project`, local-disk storage, project CRUD, client project pages |
+| 2 | Projects + storage | **in-progress** | `feat/buildcheck-phase-2` | — | `StoredFile`, `Project`, local-disk storage, project CRUD, client project pages; design: [2026-04-20-buildcheck-phase-2-projects-storage-design.md](../../superpowers/specs/2026-04-20-buildcheck-phase-2-projects-storage-design.md) |
 | 3 | Jobs infrastructure | planned | — | — | `Job`, runner + recovery, no handlers yet |
 | 4a | Sidecar + upload + explore | planned | — | — | FastAPI sidecar skeleton, `/explore` only, upload endpoint, per-project sha256 dedup, `DxfFile.explorationJson` + `structuralHash` |
 | 4b | Codegen + execute + self-correct | planned | — | — | Sidecar `/execute`, Claude Opus codegen + fix prompts, `ExtractionScript` cache (global, append-only), state-machine handler, `DxfFile.complianceData` populated |
