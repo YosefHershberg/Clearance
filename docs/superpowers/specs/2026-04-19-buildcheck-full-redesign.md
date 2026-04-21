@@ -1,10 +1,26 @@
 # BuildCheck AI — Full Redesign for the Clearance Codebase
 
-**Date:** 2026-04-19 (original), **revised 2026-04-20** for v3 DXF pipeline
-**Status:** Approved for implementation planning. Phases 0 + 1a already merged under the original §3.4/§7 design; v3 pipeline applies from Phase 4 onward.
+**Date:** 2026-04-19 (original), **revised 2026-04-20** for v3 DXF pipeline, **revised 2026-04-21** for v3.1 visual-bridge codegen
+**Status:** Approved for implementation planning. Phases 0 + 1a + 1b + 2 + 3 + 4a already merged into `integration/buildcheck`; v3.1 pipeline applies to Phase 4b onward.
 **Supersedes:** `2026-04-19-auth-roles-security-design.md` (which covered only the auth slice).
 
 This spec is the canonical end-to-end design for rebuilding BuildCheck AI in the Clearance codebase. It covers every subsystem: identity, projects, file storage, DXF/PDF pipelines, compliance agents, chat, and the job queue. Implementation is phased (§13) but the design is unified.
+
+### Revision note — 2026-04-21 (v3.1 visual-bridge codegen)
+
+v3 (2026-04-20) fed Claude a text-only `explorationJson` and leaned on an elaborate system prompt embedding a Hebrew keyword table, a dual-viewport heuristic, and spatial-correlation rules. Ongoing testing surfaced a deeper problem: Israeli DXFs encode Hebrew in at least four different ways (Unicode escapes, raw UTF-8, SHX-font Latin substitution like `"eu cbhhi"` for `"קו בניין"`, and CP862/Windows-1255 legacy code pages). The ~40% SHX case contains zero Hebrew bytes — any decoder catalog breaks on the next architect whose font mapping differs. Hardcoded encoding logic cannot generalize.
+
+v3.1 keeps the four-phase pipeline shape but adds a **visual bridge** so Claude can resolve encoding per-file from the drawings themselves instead of from hardcoded decoders. Changes:
+
+- **New generic script:** `dxf_sheet_renderer.py` emits one PNG per sheet with numbered red dots overlaid at each sampled text position. Dot `N` in the PNG ↔ `text_samples[N-1]` in the exploration JSON (hard ordering invariant).
+- **Explorer changes:** samples carry both `raw` (byte-exact, no decoding) and `decoded?` (best-effort Hebrew, nullable). Sampling spans `TEXT | MTEXT | ATTRIB | ATTDEF`. New encoding-signal flags per block: `hasUnicodeEscapes`, `hasNativeHebrew`, `hasPossibleShx`, `hasHighBytes`. Sample cap per block raised 30 → 50.
+- **Codegen becomes multimodal:** `anthropic.generateExtractionScript()` sends `{explorationJson, thumbnails[]}`; Claude classifies sheets visually, correlates dot positions to architectural features, and emits a script that matches **raw** strings (e.g. `LABELS["building_line"] = "eu cbhhi"`) rather than decoded Hebrew. System prompt shrinks: no Hebrew keyword table, no hardcoded dual-viewport heuristic, no spatial-rule block — those become contract/shape constraints, not recognition rules.
+- **Model choice (v1):** `claude-opus-4-7` + vision stays. Sonnet 4.6 + vision is a deferred A/B optimization (§14) — telemetry first. `ExtractionScript.generatedByModel` already supports the switch.
+- **New sidecar endpoint `POST /render-thumbnails`** (separate from `/explore` so the cache-hit path can short-circuit before rendering). `/explore` stays fingerprint-only; `/render-thumbnails` runs only on a cache miss and writes transient PNGs. Thumbnails are deleted at the end of the handler and never persisted as `StoredFile`.
+- **Matplotlib** re-enters the sidecar container (only for `/render-thumbnails`; final per-sheet SVGs still come from the generated execution script at `/execute`).
+- **Phase 4a migration:** existing `DxfFile.explorationJson` + `structuralHash` are nulled on non-COMPLETED rows on Phase 4b deploy. Completed rows (none expected at this point) are untouched.
+
+Sections affected: §2.12 (sidecar contract); §2.13 (efficiency); §2.20 (full rewrite); §3.4 (explorer output shape note); §3.12 (change-summary row); §7.1 (both endpoints); §7.3 (handler state machine); §7.4 (codegen prompts); §7.5 (efficiency recap); §13 (Phase 4b scope expanded); §14 (Sonnet A/B + visual-bridge open questions).
 
 ### Revision note — 2026-04-20 (v3 DXF pipeline)
 
@@ -162,21 +178,22 @@ Boot-time recovery: any `Job` stuck in `RUNNING` older than 30 min (or with null
 
 ### 2.12 Python as an HTTP sidecar
 
-Not `execFile('python3 ...')` per invocation. A FastAPI service in its own container exposes two endpoints for the v3 pipeline:
-- `POST /explore` — body: `{ storedFileUri, reqId }`, returns `{ explorationJson, structuralHash, ms }`. Runs the generic `dxf_explorer.py` fingerprinter.
+Not `execFile('python3 ...')` per invocation. A FastAPI service in its own container exposes three endpoints for the v3.1 pipeline:
+- `POST /explore` — body: `{ storedFileUri, reqId }`, returns `{ explorationJson, structuralHash, ms }`. Runs the generic `dxf_explorer.py` fingerprinter. Fingerprint only — no thumbnails. (Kept cheap so the cache-hit path can short-circuit before rendering.)
+- `POST /render-thumbnails` — body: `{ storedFileUri, explorationJson, thumbnailDir, reqId }`, returns `{ thumbnails: [{sheetKey, pngUri}], ms }`. Runs `dxf_sheet_renderer.py` consuming the explorer output (never re-enumerates ezdxf for text ordering). Called only when codegen is about to run (structural-hash cache miss). Thumbnails are transient — deleted at end of handler.
 - `POST /execute` — body: `{ storedFileUri, scriptUri, outputDir, reqId }`, returns `{ ok: true, complianceData, renders[], ms }` on success, or `{ ok: false, traceback, ms }` on script crash (HTTP 200 in both cases — a script crash is a normal outcome that feeds the self-correction loop).
 - `GET /health` — liveness.
 
 **Sidecar invariants:**
 - Never calls Claude. No Anthropic key in Python.
 - Never writes to Postgres. Node owns all DB writes.
-- Shares the `uploads/` volume with Node so `storedFileUri` + `scriptUri` + `outputDir` resolve to the same absolute paths on both sides.
+- Shares the `uploads/` volume with Node so `storedFileUri` + `scriptUri` + `outputDir` + `thumbnailDir` resolve to the same absolute paths on both sides.
 - Forwards `X-Request-Id` from Node's `req.id` into its logs for cross-service stitching.
-- No matplotlib in the container (SVGs are emitted as raw text by the AI-generated extraction script).
+- Matplotlib is used only for thumbnail rendering inside `/render-thumbnails`. Per-sheet SVGs in the final output still come from the AI-generated extraction script at `/execute` (no matplotlib in the generated script).
 
-Timeouts: `/explore` 30s; `/execute` 120s wall clock. Node-side `DXF_EXTRACTION` job timeout 5 min (covers explore + codegen + up to two execute attempts).
+Timeouts: `/explore` 30s; `/render-thumbnails` 30s; `/execute` 120s wall clock. Node-side `DXF_EXTRACTION` job timeout 5 min (covers explore + optional thumbnails + codegen + up to two execute attempts).
 
-One compose service, one internal port, one integration adapter (`integrations/python-sidecar.client.ts` exposing `explore()` + `execute()`).
+One compose service, one internal port, one integration adapter (`integrations/python-sidecar.client.ts` exposing `explore()` + `renderThumbnails()` + `execute()`).
 
 ### 2.13 DXF pipeline efficiency
 
@@ -184,8 +201,9 @@ Applied together in §7:
 - **Byte sha256 dedup** (per project): re-uploading identical bytes returns the existing `DxfFile` row, no re-extraction, no codegen cost.
 - **Structural-hash cache** (global, append-only): extraction scripts are keyed by the sha256 of the canonicalized exploration JSON. Two different DXFs with the same block structure share the cached script — $1 Opus codegen cost amortizes across identical-structure files from the same architect. See §2.20.
 - **Pass-through `complianceData`**: the v3 extractor's JSON is stored as-is on `DxfFile.complianceData` and consumed directly by agents. No normalization layer to drift against prompt evolution.
-- **Renders inline with extraction**: SVGs are produced by the AI-generated script during `/execute` and persisted in the same transaction as `complianceData`. No separate `DXF_RENDER` job.
+- **Renders inline with extraction**: final per-sheet SVGs are produced by the AI-generated script during `/execute` and persisted in the same transaction as `complianceData`. No separate `DXF_RENDER` job.
 - **Per-sheet `svgWarning`**: failed/underfilled renders flag individual sheets rather than failing the whole extraction. UI surfaces warnings; agent prefers unwarned sheets when citing evidence.
+- **Transient codegen thumbnails**: PNG thumbnails are produced by the separate `/render-thumbnails` endpoint, called only on a cache miss after `/explore` returns its structural hash. Written to a per-job temp directory, consumed by codegen, and deleted when the handler finishes. Not persisted as `StoredFile` — they have no post-codegen purpose. Cache hits skip this step entirely, saving ~10s per hit.
 
 ### 2.14 Chat — per-Project
 
@@ -248,20 +266,37 @@ No `Job`, no worker, no pub/sub. SSE is scoped to this one endpoint.
 
 **Analysis-status live updates stay on polling** for v1. Polling at 2.5 s is acceptable for status that changes 4-5 times over 3 minutes. Migrating to SSE for analysis status is §14 open-question material.
 
-### 2.20 v3 DXF extraction — AI-generated per-file scripts
+### 2.20 v3.1 DXF extraction — AI-generated per-file scripts with a visual bridge
 
-Every architect produces DXF files differently: different block names, layer conventions, text encoding, coordinate scales, sheet organization. A single hardcoded extractor cannot generalize. The v3 pipeline splits extraction into four phases:
+Three sources of variance defeat any hardcoded extractor:
 
-1. **Explore** — `dxf_explorer.py` (generic, static) fingerprints the file: block entity counts, bounding boxes, 30 sample texts per block (Hebrew-decoded), text-pattern flags, layer usage, polyline stats, auto-detected dual-viewport pattern. ~5s, $0. Never changes.
-2. **Codegen** — Node sends the exploration JSON to Claude Opus with a system prompt embedding the spatial-correlation / dual-viewport / SVG rules. Claude emits a complete Python extraction script tailored to this specific file's structure. ~88s, ~$1.
-3. **Execute** — the generated script runs via the sidecar's `/execute` endpoint against the original DXF. Output: `compliance_data.json` (setbacks, building envelope dimensions, plot edges, parking bays, heights, survey data) + SVG renders per sheet. ~8s, $0.
-4. **Self-correct** — if the script crashes (~30% of first runs on novel files), Node re-prompts Claude Opus with the traceback + broken code. The corrected script succeeds >90% of the time. v1 allows one correction attempt; further retries are §14 deferred.
+1. **Structural variance.** Every architect names blocks, organizes sheets, and scales coordinates differently. No Israeli standard exists.
+2. **Encoding chaos.** Hebrew in Israeli DXFs is stored four different ways: Unicode escapes (`\U+05E7\U+05D5`, ~30% of files), raw UTF-8 Hebrew bytes (~20%), **SHX-font Latin substitution** where AutoCAD displays Latin characters as Hebrew through font glyph mapping (`"eu cbhhi"` renders as `"קו בניין"`, ~40% — the hardest case because the file contains zero Hebrew bytes), and legacy code pages CP862 / Windows-1255 (~10%). A decoder catalog breaks on the next architect whose SHX font mapping differs.
+3. **Spatial context determines meaning.** The number `400` between a `"קו בניין"` label and a `"גבול מגרש"` label is a 4.00 m setback. The same `400` in a floor-plan dimension chain is a 4.00 m room width. Only position disambiguates.
 
-**Two caches compound:** byte-sha256 dedup (identical files skip all phases) and structural-hash codegen cache (structurally-similar files skip phase 2). Cache hit: ~13s, $0. Cold first run: ~100–160s, ~$1–1.50.
+**The core move: don't decode, let Claude see the drawings.** The v3.1 pipeline ships three generic, stable scripts that never interpret anything, plus a per-file AI-generated script. Orchestration happens Node-side.
 
-**Dual-viewport architecture** is the non-obvious structural insight the generated scripts must handle: each logical sheet (floor plan, elevation, etc.) in Israeli permit DXFs is a **composite** of one geometry viewport block (LINE/POLYLINE/INSERT — walls, hatching, furniture) plus one annotation viewport block (TEXT/dimension LINEs) that spatially overlap. The exploration phase flags this pattern; the codegen system prompt instructs Claude to pair geometry VPs with their annotation VPs when producing SVGs and extracting values. Non-dual-VP files (some architects use single-VP or modelspace content) still produce one `SheetRender` row per sheet — the script figures out the layout.
+**Four phases:**
 
-**Spatial correlation is the core extraction challenge** — not parsing entities. ezdxf extracts entities reliably. The hard part is understanding what numbers mean by their position relative to labels: the integer "400" next to "קו בניין" means a 4.00m setback; the same "400" in a floor-plan dimension chain means a 4.00m room width. Context is position. The codegen prompt includes rules for setback extraction (numbers between `קו בניין` and `גבול מגרש` labels), dimension-chain assembly (group integers by X position), survey value separation (values >600 = elevations, <50 = edge lengths), and parking bay pairing (integer pairs near `חנייה` labels).
+1. **Explore — `dxf_explorer.py` (generic, static).** Fingerprints the file without interpreting anything. Per-block entity counts (`LINE / POLYLINE / CIRCLE / ARC / INSERT / TEXT / MTEXT / ATTRIB / ATTDEF`), bounding boxes, layer usage, polyline stats, INSERT graph. **Up to 50 text samples per block spanning `TEXT | MTEXT | ATTRIB | ATTDEF`**, each carrying `{raw, decoded?, x, y, block, handle, layer, entityType}`. `raw` is byte-exact ezdxf output, never decoded. `decoded` is best-effort Hebrew via `_combine_and_scrub_surrogates` (nullable — null when decoding would be lossy or indeterminate) and is kept only as a *hint*, not a source of truth. **Encoding-signal flags per block:** `hasUnicodeEscapes`, `hasNativeHebrew`, `hasPossibleShx`, `hasHighBytes`. Also emits the existing text-pattern flags (`hasIntegers`, `hasDecimals`, `hasHeights`, `hasCoordinates`). Auto-detected dual-viewport pattern is kept as a **hint**, not a hard classifier. ~5s, $0. Never changes.
+
+2. **Render thumbnails — `dxf_sheet_renderer.py` (generic, static).** One PNG per logical sheet (~1200×900 px). Geometry (`LINE / POLYLINE / CIRCLE / ARC`) drawn in black; **numbered red dots overlaid at each sampled text position**. Hard ordering invariant: the renderer consumes `explorationJson.text_samples` and plots dots in that exact order — dot `N` in the PNG ↔ `text_samples[N-1]` in the JSON. The renderer never re-enumerates ezdxf for text ordering. Dot-density policy: keep non-numeric samples first (`length ≥ 3`, regex `^[-+]?\d+(\.\d+)?%?$` deprioritized), de-duplicate near-coincident positions (< bbox-diagonal / 200), cap at ~100 dots per sheet. Pure-numeric texts are ASCII and need no visual disambiguation. ~10s, $0. Never changes. Runs only on a structural-hash cache miss.
+
+3. **Codegen — Claude (v1: `claude-opus-4-7` + vision).** Node sends a multimodal message containing `explorationJson` (text) and each sheet thumbnail (image). Claude (a) classifies each sheet visually (a floor plan looks like a floor plan regardless of text encoding — door swing arcs, bathroom fixtures, kitchen counters; an elevation looks like an elevation — building profile with stone hatching, windows, ground line), (b) uses the dot numbers to correlate raw text samples with architectural features, inferring what each **raw** string means for *this* file (dot `#12` sits on a boundary edge, `text_samples[11].raw == "eu cbhhi"` → in this file, `"eu cbhhi"` labels a building line), and (c) emits a Python extraction script that matches **raw strings**, not decoded Hebrew. The generated script starts with a `LABELS` dict mapping semantic names (`"building_line"`, `"plot_boundary"`, `"kitchen"`, …) to the **raw** strings actually present in the file. Numbers are encoding-agnostic (ASCII digits / decimal points / `+` / `%`); only labels need a map. ~60–90s, ~$1 per cold run. Scripts are cached by structural hash; structurally-similar files skip this phase.
+
+4. **Execute + self-correct — `/execute` endpoint.** The generated script runs as a subprocess against the original DXF. Output: `complianceData` (setbacks, heights, dimensions, parking, survey data, label correlations) + per-sheet SVG renders. On crash, Node re-prompts Claude Opus once with the traceback + broken code; the corrected script succeeds >90% of the time. v1 allows one correction attempt; further retries are §14 deferred.
+
+**Why "don't decode" beats a decoder catalog.** SHX font mappings vary between fonts, the `.shx` files aren't available on the server, and new encoding variants appear with every new architect's file. The visual bridge sidesteps the entire problem: Claude builds a **file-specific** label map from whatever raw strings ezdxf returns, regardless of how AutoCAD stored them. Re-exporting a file with a different encoding yields different `raw` strings AND a different structural hash, so a new cache entry is fetched — the pipeline is re-parametrized, not broken.
+
+**Why the dot-number bridge works.** The ordering invariant (dot `N` ↔ `text_samples[N-1]`) is enforced by having the renderer consume the explorer's sample list rather than re-enumerating entities. This makes the PNG and the JSON two projections of one ordered list. Claude can point at dot `#12` in the image and reference `text_samples[11]` in the JSON; the mapping is unambiguous.
+
+**System prompt shrinks dramatically.** v3's prompt embedded a Hebrew keyword table, a dual-viewport bbox-overlap heuristic, and prose rules for setback / dimension-chain / survey / parking extraction. v3.1 drops all of that. The new prompt describes the **contract** (required `complianceData` schema, SVG rendering rules — Y-axis flip, stroke width, ACI color table, text-as-`<text>`-elements overlay) and the **visual-bridge protocol** (how dots map to samples, required `LABELS` dict preamble, "match raw strings, not decoded Hebrew"). Recognition logic stays inside Claude's vision call, where it can adapt to whatever this specific file looks like.
+
+**Model choice (v1 → deferred A/B).** Codegen runs on `claude-opus-4-7` + vision in v1. Opus is the reliability baseline for complex Python generation while we validate the new architecture. After Phase 4b ships and telemetry accumulates (self-correction rate, generation time, cost per cold run), Sonnet 4.6 + vision is an A/B candidate — `ExtractionScript.generatedByModel` supports the switch without migration. See §14.
+
+**Two caches compound.** Byte-sha256 per-project dedup (identical files skip everything) and structural-hash global codegen cache (structurally-similar files skip phases 2 and 3). Cache hit: ~15s, $0 (explore + execute only). Cold first run: ~100–160s, ~$1–1.15.
+
+**Phase 4a carry-over.** The Phase 4a explorer's `_combine_and_scrub_surrogates` is retained but repurposed: it populates `decoded` alongside `raw`, rather than being the only sample. Phase 4b ships a one-time migration that nulls `DxfFile.explorationJson` + `structuralHash` on any non-COMPLETED `DxfFile` row, forcing a re-explore on next upload. COMPLETED rows (none expected at this stage) are untouched.
 
 ---
 
@@ -435,6 +470,7 @@ model ExtractionScript {
 - `ExtractionScript` rows are **append-only and global**: keyed by the structural fingerprint of the exploration JSON, not scoped to a project. A cache hit across users is expected — the scripts are machine-generated Python that classifies blocks and extracts numbers (no user data embedded). On self-correction, a new row is inserted and wins via `ORDER BY createdAt DESC LIMIT 1`; the original row is retained for audit.
 - `DxfFile.complianceData` shape is defined by the v3 extractor's system prompt (§2.20, §7.3). It evolves with the prompt; no Prisma migration is needed when new fields appear. The agent-facing contract is "whatever is in `complianceData`, plus the `sheets` list" (§9.1).
 - `DxfFile.explorationJson` and `DxfFile.complianceData` are **machine-fuel only** — never surfaced as raw JSON in the UI (§4.10). The UI reads `SheetRender[]` for sheets and `ComplianceResult[]` for results.
+- **`DxfFile.explorationJson` shape (v3.1):** `{ blocks: {[name]: {entityCounts, bbox, layers, polylineStats, insertsInto[], textPatternFlags, encodingFlags, textSamples: [{raw, decoded?, x, y, block, handle, layer, entityType}, ...]}}, hints: {dualViewportPairs[], dimensionUnitGuess}, header: {version, fonts, styles} }`. `text_samples` is an **ordered** list per block; the renderer relies on this order for the dot-number invariant. `raw` is byte-exact; `decoded` is nullable. Encoding flags: `hasUnicodeEscapes | hasNativeHebrew | hasPossibleShx | hasHighBytes`. `structuralHash = sha256(canonical(explorationJson))` — canonicalization sorts object keys, preserves array order, and serializes with no whitespace.
 
 ### 3.5 תב"ע (Tava) — zoning plan
 
@@ -697,12 +733,12 @@ model ChatMessage {
 | Session                  | JWT in Authorization header, localStorage    | HttpOnly cookie, SameSite=Strict (§2.4)                           |
 | Disable lockout          | Bearer-token only; re-check on login         | DB lookup per authenticated request (§2.5)                        |
 | File storage             | Path fields per file model                   | Unified `StoredFile` with `sha256` (§2.7, §3.2)                   |
-| DXF extractor (v1→v3)    | Hardcoded `execFile` extractor per project   | `dxf_explorer.py` (generic) + AI-generated per-file script + self-correct (§2.20, §7) |
+| DXF extractor (v1→v3.1)  | Hardcoded `execFile` extractor per project   | `dxf_explorer.py` + `dxf_sheet_renderer.py` (both generic) + multimodal AI-generated per-file script via visual-bridge codegen + self-correct (§2.20, §7) |
 | DXF data shape           | Normalized `Viewport` + `ParsedValue`        | `DxfFile.complianceData` JSON pass-through (§3.4)                 |
 | DXF sheet model          | `Viewport` (1 per block) + `RenderedImage`   | `SheetRender` (1 per logical sheet; carries SVG + classification) (§3.4) |
 | DXF codegen cache        | N/A                                           | `ExtractionScript` global append-only, keyed by structural hash (§3.4, §7.3) |
 | Renders                  | PNG at 150/300 DPI, separate `DXF_RENDER` job| SVG per sheet, produced inline with `/execute`, no separate job (§2.13, §7) |
-| Sidecar contract         | `/extract` + `/render` (hardcoded)           | `/explore` + `/execute` (sidecar never calls Claude) (§2.12, §7.1)|
+| Sidecar contract         | `/extract` + `/render` (hardcoded)           | `/explore` + `/render-thumbnails` + `/execute` (sidecar never calls Claude) (§2.12, §7.1) |
 | Requirements             | JSON array on `TavaFile.requirements`        | Normalized `Requirement` + `TavaPage` (§3.5)                      |
 | Compliance results       | JSON arrays on Analysis/AddonRun             | Unified polymorphic `ComplianceResult` + `sheetRenderId` (§3.9)   |
 | Addon docs               | 1:1 per (project, domain), replace on re-up  | 1:N, `AddonRun` pins version (§2.9)                               |
@@ -1130,13 +1166,13 @@ Client owns a copy of each Zod schema; top comment says "keep in sync with `serv
 
 ---
 
-## 7. DXF Pipeline (v3)
+## 7. DXF Pipeline (v3.1)
 
-The v3 pipeline has four phases (explore, codegen-or-cache-hit, execute, self-correct) orchestrated by Node, with two endpoints on the Python sidecar. See §2.20 for the architectural rationale.
+The v3.1 pipeline has four phases (explore → [cache-hit? skip : render-thumbnails + codegen] → execute → self-correct) orchestrated by Node, with three endpoints on the Python sidecar. See §2.20 for the architectural rationale; the end-to-end diagram lives in §7.6.
 
 ### 7.1 Python sidecar service
 
-**Container:** compose service `python-sidecar`, FastAPI 0.115+, uvicorn, ezdxf ≥1.3, numpy, shapely. No matplotlib, no tesseract, no pdftotext (those are Node-side, see §8). Mounts the same `uploads/` volume as Node at the same path. Listens on `python-sidecar:5000` (internal only).
+**Container:** compose service `python-sidecar`, FastAPI 0.115+, uvicorn, ezdxf ≥1.3, matplotlib ≥3.8, numpy, shapely. No tesseract, no pdftotext (those are Node-side, see §8). Matplotlib is used only for `/render-thumbnails`; the final per-sheet SVGs at `/execute` are emitted as raw text by the AI-generated extraction script. Mounts the same `uploads/` volume as Node at the same path. Listens on `python-sidecar:5000` (internal only).
 
 **Endpoints:**
 ```
@@ -1147,29 +1183,47 @@ POST /explore
   body    { storedFileUri, reqId }
   returns { explorationJson, structuralHash, ms }
 
+POST /render-thumbnails
+  body    { storedFileUri, explorationJson, thumbnailDir, reqId }
+  returns { thumbnails: [{sheetKey, pngUri, dotCount}], ms }
+
 POST /execute
   body    { storedFileUri, scriptUri, outputDir, reqId }
   returns on success  { ok: true, complianceData, renders: [...], ms }
           on crash    { ok: false, traceback: string, ms }   // HTTP 200 both cases
 ```
 
-**Sidecar invariants (repeat of §2.12 for §7 locality):** never calls Claude; never writes to Postgres; resolves `storedFileUri` / `scriptUri` / `outputDir` against the shared volume; forwards `X-Request-Id` to logs; HTTP 5xx only for sidecar process errors, not script crashes.
+**Sidecar invariants (repeat of §2.12 for §7 locality):** never calls Claude; never writes to Postgres; resolves `storedFileUri` / `scriptUri` / `outputDir` / `thumbnailDir` against the shared volume; forwards `X-Request-Id` to logs; HTTP 5xx only for sidecar process errors, not script crashes.
 
-**`/explore` logic:**
-- Runs `dxf_explorer.py` (static, never changes across DXFs):
-  - Iterates every block; counts LINE / POLYLINE / ARC / CIRCLE / INSERT / TEXT per block
-  - Computes per-block bounding boxes
-  - Samples up to 30 texts per block, Hebrew-decoded via `_combine_and_scrub_surrogates`
-  - Records text-pattern flags: has Hebrew, has integers, has decimals, has heights (`+N.NN` format), has coordinates
-  - INSERT graph: which blocks reference which sub-blocks
-  - Layer usage per block
-  - Polyline stats: count, closed/open split, vertex distributions
-  - Auto-detects dual-viewport pattern (pairs of overlapping VP blocks with the ratio of LINE-only vs TEXT-only)
-  - Pre-digests classification keywords (floor plan / elevation / section / survey / parking Hebrew words) per block
-- Returns `explorationJson` (~100KB for a 30MB DXF) + `structuralHash = sha256(canonical(explorationJson))`.
+**`/explore` logic — runs `dxf_explorer.py` (static, never changes across DXFs):**
+- Iterates every block; counts `LINE / POLYLINE / ARC / CIRCLE / INSERT / TEXT / MTEXT / ATTRIB / ATTDEF` per block.
+- Computes per-block bounding boxes.
+- Samples up to **50 texts per block** across `TEXT | MTEXT | ATTRIB | ATTDEF`. Each sample is `{raw, decoded, x, y, block, handle, layer, entityType}`:
+  - `raw` is byte-exact ezdxf output — **no decoding, no `_combine_and_scrub_surrogates`**.
+  - `decoded` is best-effort Hebrew via `_combine_and_scrub_surrogates`, kept as a hint. Set to `null` when decoding fails or would lossy-transform the bytes.
+- Records **encoding-signal flags per block**:
+  - `hasUnicodeEscapes` — any raw sample contains `\U+XXXX`
+  - `hasNativeHebrew` — any raw sample contains UTF-8 Hebrew bytes (U+0590–U+05FF)
+  - `hasPossibleShx` — letter-pair frequency in raw samples matches SHX Latin glyph distribution (cheap statistical heuristic; false positives acceptable)
+  - `hasHighBytes` — non-ASCII, non-UTF-8 bytes present (suggests CP862 / Windows-1255)
+- Records text-pattern flags: `hasIntegers`, `hasDecimals`, `hasHeights` (`+N.NN` format), `hasCoordinates`.
+- INSERT graph, layer usage, polyline stats (count, closed/open split, vertex distributions).
+- Auto-detects dual-viewport pattern as a **hint** under `hints.dualViewportPairs[]` (not a hard classifier — codegen may override from visual evidence).
+- Guesses dimension unit (`cm | mm | m`) from coordinate value ranges under `hints.dimensionUnitGuess`.
+- Returns `explorationJson` (~100–200KB for a 30MB DXF) + `structuralHash = sha256(canonical(explorationJson))` (object keys sorted, array order preserved, no whitespace in serialization).
 - Target runtime: <5s on a 30MB file.
 
-**`/execute` logic:**
+**`/render-thumbnails` logic — runs `dxf_sheet_renderer.py` (static, never changes):**
+- Input: `storedFileUri` (the DXF), `explorationJson` (from `/explore`), `thumbnailDir` (where PNGs land).
+- For each logical sheet (derived from blocks plus the explorer's dual-viewport hints; modelspace is one implicit sheet if no block-level sheets exist):
+  - Draws geometry with matplotlib: `LINE / POLYLINE / CIRCLE / ARC` in black on a white background, axes off, aspect ratio locked.
+  - **Overlays a numbered red dot at every text sample's `(x, y)`, in the order the sample appears in `explorationJson.text_samples`.** The renderer never re-enumerates ezdxf for ordering.
+  - **Dot-density policy:** sort samples within a sheet by `(isNumeric, -length)` — non-numeric first, longer strings first. Numeric: regex `^[-+]?\d+(\.\d+)?%?$`. De-duplicate near-coincident positions (< bbox-diagonal / 200 apart). Cap at **100 dots per sheet**. The cap is applied *after* the invariant — skipped samples keep their global dot number (so dots may be non-contiguous within a sheet, but `N` ↔ `text_samples[N-1]` globally). Dropped dots are fine — Claude doesn't need every text position labeled, only enough to anchor the visual map.
+  - Writes `{thumbnailDir}/{sheetKey}.png` at ~1200×900 px. `sheetKey` is the block name, or `"modelspace"` for modelspace content.
+- Returns `thumbnails: [{sheetKey, pngUri, dotCount}]`. `dotCount` is the number of dots actually rendered after dedup/cap — for admin/debug.
+- Target runtime: <10s on a 30MB file.
+
+**`/execute` logic — unchanged from v3.0:**
 - Reads the Python script at `scriptUri` from the shared volume.
 - Runs it as a subprocess (`python3 scriptUri dxfPath outputDir`), captures stdout (expected to be JSON: `complianceData` + `renders[]`) and stderr.
 - On non-zero exit: returns `{ ok: false, traceback: stderr, ms }` with HTTP 200.
@@ -1192,110 +1246,128 @@ POST /execute
 
 ### 7.3 DXF_EXTRACTION job handler (state machine)
 
-One handler runs the full v3 state machine. Persists `DxfFile.extractionTrace` as it goes so admins can inspect which phase took how long and what went wrong. Heartbeat every 15s. 5-min wall-clock timeout enforced by the job runner (§10).
+One handler runs the full v3.1 state machine. Persists `DxfFile.extractionTrace` as it goes so admins can inspect which phase took how long and what went wrong. Heartbeat every 15s. 5-min wall-clock timeout enforced by the job runner (§10).
 
 ```
 handle(job):
   dxf = dxfFile.findById(job.dxfFileId, { include: { storedFile: true } })
   trace = { cacheHit: null, attempts: 0, phases: [] }
+  thumbnailDir = `uploads/tmp/thumbnails/${dxf.id}/`     # per-job temp, deleted in finally
   dxfFile.update({ extractionStatus: EXTRACTING })
 
-  # Phase 1 — explore
-  t0 = now()
-  { explorationJson, structuralHash } = await sidecar.explore({
-    storedFileUri: dxf.storedFile.uri, reqId
-  })
-  trace.phases.push({ phase: 'explore', ms: now() - t0 })
+  try:
+    # Phase 1 — explore (fingerprint only, no thumbnails)
+    t0 = now()
+    { explorationJson, structuralHash } = await sidecar.explore({
+      storedFileUri: dxf.storedFile.uri, reqId
+    })
+    trace.phases.push({ phase: 'explore', ms: now() - t0 })
 
-  # Phase 2 — codegen OR cache hit
-  script = await extractionScript.findLatestByHash(structuralHash)
-  if script:
-    trace.cacheHit = true
-  else:
-    t1 = now()
-    { code, costUsd, ms } = await anthropic.generateExtractionScript({
-      explorationJson, reqId
-    })
-    stored = await storage.saveBuffer('EXTRACTION_SCRIPT', '.py', Buffer.from(code))
-    scriptFile = await storedFile.create({ kind: EXTRACTION_SCRIPT, ...stored })
-    script = await extractionScript.create({
-      structuralHash, storedFileId: scriptFile.id,
-      generatedByModel: 'claude-opus-4-7', generationCostUsd: costUsd, generationMs: ms,
-    })
-    trace.cacheHit = false
-    trace.phases.push({ phase: 'codegen', ms: now() - t1, costUsd })
+    # Phase 2 — codegen OR cache hit
+    script = await extractionScript.findLatestByHash(structuralHash)
+    if script:
+      trace.cacheHit = true
+    else:
+      # Phase 1.5 — render thumbnails (cache miss only)
+      t1a = now()
+      { thumbnails } = await sidecar.renderThumbnails({
+        storedFileUri: dxf.storedFile.uri,
+        explorationJson, thumbnailDir, reqId,
+      })
+      trace.phases.push({ phase: 'render-thumbnails', ms: now() - t1a, sheetCount: thumbnails.length })
 
-  # Phase 3+4 — execute, self-correct once on crash
-  outputDir = `uploads/renders/${dxf.id}/`
-  attempt = 0
-  while attempt < 2:
-    attempt += 1
-    trace.attempts = attempt
-    t2 = now()
-    result = await sidecar.execute({
-      storedFileUri: dxf.storedFile.uri,
-      scriptUri: script.storedFile.uri,
-      outputDir, reqId,
-    })
-    trace.phases.push({ phase: `execute.${attempt}`, ms: now() - t2, ok: result.ok })
-    if result.ok: break
-    if attempt == 1:
-      t3 = now()
-      brokenCode = await storage.readText(script.storedFile.uri)
-      { code, costUsd, ms } = await anthropic.fixExtractionScript({
-        explorationJson, brokenCode, traceback: result.traceback, reqId,
+      # Phase 2 — multimodal codegen
+      t1b = now()
+      { code, costUsd, ms } = await anthropic.generateExtractionScript({
+        explorationJson, thumbnails, reqId,   # thumbnails: [{sheetKey, pngUri}]
       })
       stored = await storage.saveBuffer('EXTRACTION_SCRIPT', '.py', Buffer.from(code))
-      fixedFile = await storedFile.create({ kind: EXTRACTION_SCRIPT, ...stored })
+      scriptFile = await storedFile.create({ kind: EXTRACTION_SCRIPT, ...stored })
       script = await extractionScript.create({
-        structuralHash, storedFileId: fixedFile.id, fixedFromScriptId: script.id,
+        structuralHash, storedFileId: scriptFile.id,
         generatedByModel: 'claude-opus-4-7', generationCostUsd: costUsd, generationMs: ms,
       })
-      trace.phases.push({ phase: 'self-correct', ms: now() - t3, costUsd })
+      trace.cacheHit = false
+      trace.phases.push({ phase: 'codegen', ms: now() - t1b, costUsd })
 
-  if not result.ok:
-    dxfFile.update({
-      extractionStatus: FAILED,
-      extractionError: result.traceback.slice(-2000),
-      extractionTrace: trace,
-      structuralHash,
-      explorationJson,
-    })
-    throw JobFailed('extraction.exhausted-retries')
+    # Phase 3+4 — execute, self-correct once on crash
+    outputDir = `uploads/renders/${dxf.id}/`
+    attempt = 0
+    while attempt < 2:
+      attempt += 1
+      trace.attempts = attempt
+      t2 = now()
+      result = await sidecar.execute({
+        storedFileUri: dxf.storedFile.uri,
+        scriptUri: script.storedFile.uri,
+        outputDir, reqId,
+      })
+      trace.phases.push({ phase: `execute.${attempt}`, ms: now() - t2, ok: result.ok })
+      if result.ok: break
+      if attempt == 1:
+        # Self-correction uses the traceback, NOT the thumbnails (text-only fix prompt)
+        t3 = now()
+        brokenCode = await storage.readText(script.storedFile.uri)
+        { code, costUsd, ms } = await anthropic.fixExtractionScript({
+          explorationJson, brokenCode, traceback: result.traceback, reqId,
+        })
+        stored = await storage.saveBuffer('EXTRACTION_SCRIPT', '.py', Buffer.from(code))
+        fixedFile = await storedFile.create({ kind: EXTRACTION_SCRIPT, ...stored })
+        script = await extractionScript.create({
+          structuralHash, storedFileId: fixedFile.id, fixedFromScriptId: script.id,
+          generatedByModel: 'claude-opus-4-7', generationCostUsd: costUsd, generationMs: ms,
+        })
+        trace.phases.push({ phase: 'self-correct', ms: now() - t3, costUsd })
 
-  # Phase 5 — persist (single transaction)
-  await prisma.$transaction(async tx => {
-    for (render of result.renders):
-      sf = await tx.storedFile.create({
-        kind: RENDER,
-        uri: `${outputDir}${render.filename}`,
-        sha256: computed, sizeBytes: render.sizeBytes,
-        originalName: render.filename,
+    if not result.ok:
+      dxfFile.update({
+        extractionStatus: FAILED,
+        extractionError: result.traceback.slice(-2000),
+        extractionTrace: trace,
+        structuralHash,
+        explorationJson,
       })
-      await tx.sheetRender.create({
-        dxfFileId: dxf.id, storedFileId: sf.id,
-        sheetIndex: render.sheetIndex,
-        displayName: render.displayName,
-        classification: render.classification,
-        geometryBlock: render.geometryBlock,
-        annotationBlock: render.annotationBlock,
-        svgWarning: render.svgWarning,
+      throw JobFailed('extraction.exhausted-retries')
+
+    # Phase 5 — persist (single transaction)
+    await prisma.$transaction(async tx => {
+      for (render of result.renders):
+        sf = await tx.storedFile.create({
+          kind: RENDER,
+          uri: `${outputDir}${render.filename}`,
+          sha256: computed, sizeBytes: render.sizeBytes,
+          originalName: render.filename,
+        })
+        await tx.sheetRender.create({
+          dxfFileId: dxf.id, storedFileId: sf.id,
+          sheetIndex: render.sheetIndex,
+          displayName: render.displayName,
+          classification: render.classification,
+          geometryBlock: render.geometryBlock,
+          annotationBlock: render.annotationBlock,
+          svgWarning: render.svgWarning,
+        })
+      await tx.dxfFile.update({
+        id: dxf.id,
+        explorationJson, structuralHash,
+        complianceData: result.complianceData,
+        extractionTrace: trace,
+        extractionStatus: COMPLETED,
       })
-    await tx.dxfFile.update({
-      id: dxf.id,
-      explorationJson, structuralHash,
-      complianceData: result.complianceData,
-      extractionTrace: trace,
-      extractionStatus: COMPLETED,
     })
-  })
+  finally:
+    # Always clean up transient thumbnails — they have no post-codegen purpose
+    await storage.removeDirIfExists(thumbnailDir)
 ```
 
 **Design notes:**
-- **Max 1 self-correction attempt.** Your doc's telemetry shows retry succeeds >90%; a second retry has diminishing returns. If even the corrected script crashes, fail the job — admin inspects `extractionTrace` + `extractionError`.
+- **Thumbnails are rendered only on cache miss.** The cache-hit path is `explore → findLatestByHash (hit) → execute` — no renderer invocation, ~15s total. On cache miss, `render-thumbnails` adds ~10s before codegen.
+- **Self-correction is text-only.** The original codegen sees thumbnails + exploration; the fix prompt sees the traceback + broken code + exploration JSON. No thumbnails in the fix call — by the time a script has crashed, the problem is almost always an ezdxf API misuse or a raw-string mismatch, not a visual recognition error. Cheaper and faster.
+- **Max 1 self-correction attempt.** Telemetry from the v2 prototype showed retry succeeds >90%; a second retry has diminishing returns. If even the corrected script crashes, fail the job — admin inspects `extractionTrace` + `extractionError`.
 - **Append-only cache.** Both the original and corrected scripts get `ExtractionScript` rows. `findLatestByHash` picks the newest by `createdAt DESC`; a correction improves the cache for future identical-structure files.
-- **No DXF_RENDER job.** SVGs arrive from `/execute` and are persisted in the same transaction as `complianceData`.
-- **Failed extraction never partially commits.** On failure, only `extractionTrace` + `extractionError` + `explorationJson` + `structuralHash` land on `DxfFile`; no SheetRenders, no `complianceData`. This lets us debug failures (and potentially replay with a fresh codegen) without half-populated tables.
+- **No DXF_RENDER job.** Per-sheet SVGs arrive from `/execute` and are persisted in the same transaction as `complianceData`.
+- **Failed extraction never partially commits.** On failure, only `extractionTrace` + `extractionError` + `explorationJson` + `structuralHash` land on `DxfFile`; no SheetRenders, no `complianceData`. Debug with `extractionTrace` + the cached broken script.
+- **Thumbnail cleanup is in `finally`.** A crashed handler, failed job, or thrown exception still triggers directory removal. Orphan `uploads/tmp/thumbnails/*` from hard-crashed Node processes (SIGKILL before `finally` runs) are rare; an hourly sweeper is deferred to §14 item 23.
 - **Heartbeat** every 15s via setInterval so the boot-time reaper (§10.4) knows long codegen/execute calls are alive.
 
 ### 7.4 Codegen system prompts
@@ -1303,34 +1375,184 @@ handle(job):
 `integrations/anthropic.client.ts` exports two functions:
 
 ```ts
-generateExtractionScript(opts: { explorationJson, reqId }): Promise<{ code, costUsd, ms }>
-fixExtractionScript(opts: { explorationJson, brokenCode, traceback, reqId }): Promise<{ code, costUsd, ms }>
+generateExtractionScript(opts: {
+  explorationJson: object,
+  thumbnails: { sheetKey: string, pngUri: string }[],
+  reqId: string,
+}): Promise<{ code, costUsd, ms }>
+
+fixExtractionScript(opts: {
+  explorationJson: object,
+  brokenCode: string,
+  traceback: string,
+  reqId: string,
+}): Promise<{ code, costUsd, ms }>
 ```
 
-Both use `claude-opus-4-7` with a dedicated system prompt constant `EXTRACTION_CODEGEN_SYSTEM_PROMPT` at the top of the file. The prompt embeds (from §2.20):
+Both use `claude-opus-4-7` with a dedicated system prompt constant `EXTRACTION_CODEGEN_SYSTEM_PROMPT` at the top of the file. The v3.1 prompt describes the **contract** and the **visual-bridge protocol** only — it does not embed Hebrew keyword tables, dual-viewport bbox-overlap heuristics, or spatial-correlation rules. Recognition stays inside Claude's vision call.
 
-- Hebrew keyword classification table (floor plan / elevation / section / survey / parking)
-- Dual-viewport pairing rules (geometry VP >500 LINEs, annotation VP >10 TEXTs, ≥50% bbox overlap → logical sheet)
-- Spatial-correlation rules for setback extraction (integers between `קו בניין` and `גבול מגרש` labels)
-- Dimension-chain assembly (group integers by X position to form building width)
-- Survey value separation (values >600 = terrain elevations, <50 = edge lengths)
-- Parking bay pairing (integer pairs like 500×300 near `חנייה` labels)
-- SVG rendering rules (Y-axis flip, bounding-box fit, stroke width, ACI color table, text-as-`<text>`-elements overlay)
-- Required output schema for `complianceData` + `renders[]` (documented as the agent's "contract")
-- "Your output must be the complete Python script, nothing else. No fence, no commentary."
+**`generateExtractionScript` prompt outline:**
 
-The `fixExtractionScript` prompt additionally receives the broken code and the traceback, and instructs Claude to produce a minimal fix that preserves the rest of the script.
+1. **Inputs you will receive.**
+   - `explorationJson`: structural fingerprint. Each block has an ordered `text_samples` list with `{raw, decoded?, x, y, block, handle, layer, entityType}`. `raw` is byte-exact; `decoded` is a best-effort Hebrew hint (nullable — do not rely on it). Encoding-signal flags indicate how Hebrew is stored in this file (`hasUnicodeEscapes`, `hasNativeHebrew`, `hasPossibleShx`, `hasHighBytes`).
+   - One PNG thumbnail per sheet: geometry in black, **numbered red dots at text positions**. Dot `N` in the PNG corresponds to `text_samples[N-1]` in the JSON (indexed globally across the sheet, dots are dense enough to anchor the visual map even when density-capped).
+
+2. **Visual-bridge protocol (what to do with the images).**
+   - Classify each sheet by looking at it: floor plan (rooms, door arcs, fixtures), elevation (building profile, ground line, stone hatching), cross-section (floor slabs, ceiling heights), site plan / survey (plot boundary, terrain elevations), parking (bay grid), roof, index page, area calculation table, or unclassified.
+   - Use dot positions to decide what each raw string *means* for this file. Example: dot `#12` sits on a building edge adjacent to a boundary line → `text_samples[11].raw` is this file's label for "building line" (e.g. `"eu cbhhi"` or `"קו בניין"` or `\U+05E7\U+05D5 \U+05D1\U+05E0\U+05D9\U+05D9\U+05DF`, depending on encoding). Record the raw form, not a decoded form.
+
+3. **Required output: a complete Python script.** The script starts with a `LABELS` dict mapping semantic names to the raw strings present in this file:
+
+   ```python
+   LABELS = {
+       "building_line":  "eu cbhhi",          # raw string from text_samples[11].raw
+       "plot_boundary":  "dcuk ndra",
+       "ground_level":   "+0.00",              # numeric/ASCII labels unchanged
+       "kitchen":        "nycj",
+       "bedroom":        "j/ ahbv",
+       "bathroom":       "j/ rjmv",
+       "safe_room":      'nn"s',
+       # ... one entry per label the extractor will search for
+   }
+   ```
+
+   All subsequent label matching uses `.strip() == LABELS[key]` (or `in LABELS[key]` for substring, never a hardcoded Hebrew literal). Numbers are matched directly from raw text via regex — they are ASCII and encoding-agnostic.
+
+4. **Extraction contract (required `complianceData` schema).** Required top-level keys: `setbacks`, `heights`, `dimensions`, `parking`, `survey`, `labelCorrelations`. Each is an object; sub-schema documented inline in the prompt. Missing data → omit the sub-key, do not invent placeholders.
+
+5. **SVG rendering contract (for per-sheet renders returned alongside `complianceData`).** Y-axis flip (DXF Y-up → SVG Y-down), bounding-box fit, stroke width scaled to diagonal, ACI color table, text as `<text>` elements in original raw form. One SVG per sheet, named `render_NN.svg`. Each sheet carries a `displayName` (Hebrew, decoded if possible), `classification` (enum from §3.4), `geometryBlock` / `annotationBlock` (provenance), and optional `svgWarning`.
+
+6. **Output constraint.** Your output must be the complete Python script, nothing else. No fence, no commentary, no markdown.
+
+**`fixExtractionScript` prompt addendum.** Text-only: receives `brokenCode` + `traceback` + `explorationJson`. No thumbnails (by the time a script crashes, the failure is almost always an ezdxf API misuse, a string-matching bug, or a JSON-schema mistake — visual re-classification rarely helps and adds cost). Instructs: produce a minimal fix that preserves the rest of the script; do not rewrite the `LABELS` dict unless the traceback directly implicates it.
 
 Prompt drift is controlled: the system-prompt constant lives at the top of `anthropic.client.ts`, so any change shows up in PR diffs.
 
 ### 7.5 DXF pipeline efficiency recap
 
 - **Byte-sha256 per-project dedup** — identical uploads skip everything.
-- **Structural-hash global codegen cache** — $1 Opus cost only on first unique DXF structure; repeat-structure uploads run explore + execute only (~13s, $0).
-- **No blocking renders** — renders are produced inline with extraction, so there's nothing to block; per-sheet `svgWarning` surfaces degraded sheets without failing the whole job.
-- **Self-correction loop** — AI-generated Python crashes ~30% of the time on novel structures; one retry with the traceback succeeds >90%, making the pipeline resilient without human intervention.
+- **Structural-hash global codegen cache** — Opus codegen cost (~$1) only on the first unique DXF structure; repeat-structure uploads run `explore + execute` only (~15s, $0) and skip the thumbnail renderer entirely.
+- **Thumbnails only on cache miss** — `/render-thumbnails` adds ~10s to cold runs, but cache hits never pay it.
+- **No blocking renders** — final per-sheet SVGs are produced inline with extraction at `/execute`, so there's nothing to block; per-sheet `svgWarning` surfaces degraded sheets without failing the whole job.
+- **Self-correction loop** — AI-generated Python crashes ~30% of the time on novel structures; one text-only retry with the traceback succeeds >90%, making the pipeline resilient without human intervention.
 - **Pass-through JSON to agents** — `complianceData` flows unchanged into core and add-on agent prompts (§9). No normalization layer to drift against prompt evolution.
 - **Canonical UTF-8 via JSON HTTP** — surrogate-pair stdout bugs eliminated (Node never reads Python stdout directly).
+- **Visual bridge avoids decoder catalog** — raw-string matching + per-file `LABELS` dict means a new Hebrew encoding (seventh font, eighth code page) requires zero pipeline changes; Claude builds a new label map from the thumbnails.
+
+### 7.6 End-to-end pipeline diagram
+
+```
+                          DXF file uploaded
+                                  │
+                                  ▼
+                   ┌─────────────────────────────┐
+                   │ POST /api/projects/:id/dxf  │
+                   │ (Node)                      │
+                   │ - multer → uploads/dxf/…    │
+                   │ - stream sha256             │
+                   │ - per-project byte dedup  ──┼──► hit → return DxfFile, skip
+                   └──────────────┬──────────────┘
+                                  │ miss
+                                  ▼
+                    enqueue Job(DXF_EXTRACTION)
+                                  │
+                                  ▼
+       ┌────────────────────────────────────────────────────────────┐
+       │ DXF_EXTRACTION handler (Node, §7.3) — heartbeat 15s        │
+       └───┬─────────────────────────────────────────────┬──────────┘
+           │                                             │
+   Phase 1 │                                             │
+           ▼                                             │
+     ┌──────────────────────────┐                        │
+     │ sidecar POST /explore    │                        │
+     │ dxf_explorer.py          │                        │
+     │ → explorationJson        │                        │
+     │   (raw + decoded         │                        │
+     │    text_samples,         │                        │
+     │    encoding flags,       │                        │
+     │    structural hints)     │                        │
+     │ → structuralHash         │                        │
+     └────────────┬─────────────┘                        │
+                  │                                      │
+   cache lookup   ▼                                      │
+     ┌────────────────────────────┐                      │
+     │ ExtractionScript           │                      │
+     │ .findLatestByHash(hash)    │                      │
+     └───┬────────────────────┬───┘                      │
+         │                    │                          │
+     hit │                    │ miss                     │
+         │                    ▼                          │
+         │   ┌─────────────────────────────────┐         │
+         │   │ Phase 1.5 — render thumbnails    │         │
+         │   │ sidecar POST /render-thumbnails │         │
+         │   │ dxf_sheet_renderer.py           │         │
+         │   │ consumes explorationJson        │         │
+         │   │ → PNG per sheet with            │         │
+         │   │   numbered red dots at          │         │
+         │   │   text_samples positions        │         │
+         │   │   (invariant: dot N ↔ [N-1])    │         │
+         │   └─────────────┬───────────────────┘         │
+         │                 │                             │
+         │                 ▼                             │
+         │   ┌─────────────────────────────────┐         │
+         │   │ Phase 2 — multimodal codegen     │         │
+         │   │ anthropic.generateExtractionScr. │         │
+         │   │ inputs:                         │         │
+         │   │  - explorationJson (text)       │         │
+         │   │  - thumbnails[] (images)        │         │
+         │   │ output: complete Python script  │         │
+         │   │ with LABELS dict + extractor    │         │
+         │   │ v1: claude-opus-4-7 + vision    │         │
+         │   └─────────────┬───────────────────┘         │
+         │                 │                             │
+         │        persist  │                             │
+         │        StoredFile(EXTRACTION_SCRIPT)          │
+         │         + ExtractionScript row                │
+         │                 │                             │
+         └─────────────────┤                             │
+                           ▼                             │
+           ┌────────────────────────────────┐            │
+           │ Phase 3 — execute              │            │
+           │ sidecar POST /execute          │            │
+           │  python3 script dxf outputDir  │            │
+           │  → complianceData (JSON)       │            │
+           │  → renders[] (SVG per sheet)   │            │
+           └────────┬────────────┬──────────┘            │
+                    │            │                       │
+                 ok │      crash │                       │
+                    │            ▼                       │
+                    │   ┌───────────────────────────┐    │
+                    │   │ Phase 4 — self-correct    │    │
+                    │   │ anthropic.fixExtraction.. │    │
+                    │   │ text-only (no thumbnails) │    │
+                    │   │ inputs: explorationJson,  │    │
+                    │   │  brokenCode, traceback    │    │
+                    │   │ 1 attempt, then FAIL      │    │
+                    │   └──┬──────────────┬─────────┘    │
+                    │      │ ok           │ crash        │
+                    │      │              ▼              │
+                    │      │       mark DxfFile FAILED   │
+                    │      │       + extractionError     │
+                    │      │                             │
+                    ▼      ▼                             │
+           ┌────────────────────────────────┐            │
+           │ Phase 5 — persist (tx)         │            │
+           │ - StoredFile rows (kind=RENDER)│            │
+           │ - SheetRender rows per SVG     │            │
+           │ - DxfFile.complianceData       │            │
+           │ - DxfFile.explorationJson      │            │
+           │ - DxfFile.structuralHash       │            │
+           │ - DxfFile.extractionTrace      │            │
+           │ - DxfFile.status = COMPLETED   │            │
+           └──────────────┬─────────────────┘            │
+                          │                              │
+                finally:  │                              │
+                rm -rf thumbnailDir ◄──────────────────── ┘
+                          │
+                          ▼
+         consumed downstream by §9 agents
+         (complianceData + SheetRender[])
+```
 
 ---
 
@@ -1663,15 +1885,22 @@ Feeds the `writing-plans` skill. Each phase is a reviewable checkpoint; each pro
 - Client: upload dropzone on ProjectPage, `ExtractionStatusPill` (PENDING → EXTRACTING → COMPLETED/FAILED)
 - Demo: upload any DXF, see fingerprint JSON + structural hash in the response
 
-**Phase 4b — Codegen + execute + self-correct.**
+**Phase 4b — Codegen + execute + self-correct (v3.1 visual bridge).**
 - Prisma migration: `ExtractionScript` table; `DxfFile.complianceData` field added
-- Sidecar: add `/execute` endpoint (runs script subprocess, returns `complianceData + renders[]` or `{ok:false, traceback}`)
-- `integrations/python-sidecar.client.ts`: add `execute()` method
-- `integrations/anthropic.client.ts`: add `generateExtractionScript()` + `fixExtractionScript()`; dedicated `EXTRACTION_CODEGEN_SYSTEM_PROMPT` constant
-- `DXF_EXTRACTION` handler expands to the full state machine (§7.3): explore → codegen-or-cache → execute → on-crash self-correct → persist `complianceData`
-- Handler does not yet persist `SheetRender` rows (renders produced but not DB-registered)
-- Tests: structural-hash cache hit path, self-correction retry path, exhausted-retries failure path
-- Demo: cold first run ~100s at ~$1 with `complianceData` populated; re-upload structurally-similar file ~13s $0 cache hit
+- **Explorer rewrite (sidecar submodule):** `dxf_explorer.py` now emits each text sample as `{raw, decoded?, x, y, block, handle, layer, entityType}` across `TEXT | MTEXT | ATTRIB | ATTDEF`; sample cap 30 → 50; new encoding-signal flags (`hasUnicodeEscapes`, `hasNativeHebrew`, `hasPossibleShx`, `hasHighBytes`); dual-viewport detection demoted from classifier to hint; `hints.dimensionUnitGuess` added. Structural-hash canonicalization respects `text_samples` ordering (see §3.4 notes).
+- **New sidecar script: `dxf_sheet_renderer.py`** — consumes `explorationJson`, emits one PNG per sheet with numbered red dots at text-sample positions in the explorer's order. Dot-density policy: non-numeric first, dedup near-coincident, cap 100/sheet.
+- **Sidecar new endpoint `POST /render-thumbnails`** — `{storedFileUri, explorationJson, thumbnailDir, reqId}` → `{thumbnails: [{sheetKey, pngUri, dotCount}], ms}`. Matplotlib added to the sidecar container image.
+- **Sidecar new endpoint `POST /execute`** — runs the AI-generated script subprocess; returns `complianceData + renders[]` or `{ok:false, traceback}`.
+- `integrations/python-sidecar.client.ts`: add `renderThumbnails()` + `execute()` methods.
+- `integrations/anthropic.client.ts`: add `generateExtractionScript(opts: {explorationJson, thumbnails, reqId})` (multimodal — accepts image inputs) + `fixExtractionScript(opts: {explorationJson, brokenCode, traceback, reqId})` (text-only). Model: `claude-opus-4-7` + vision. Dedicated `EXTRACTION_CODEGEN_SYSTEM_PROMPT` constant describing the visual-bridge protocol + required `LABELS` dict preamble + `complianceData` schema + SVG rendering contract. **No Hebrew keyword table, no dual-viewport bbox-overlap rule, no spatial-correlation prose.**
+- **Data migration (one-time, ships with Phase 4b deploy):** null out `DxfFile.explorationJson` + `DxfFile.structuralHash` for any row where `extractionStatus != COMPLETED`. Forces a re-explore on the next upload/job run. COMPLETED rows are left alone (none expected at this stage of integration).
+- `DXF_EXTRACTION` handler expands to the full state machine (§7.3): `explore → findLatestByHash → (miss: render-thumbnails + codegen) → execute → on-crash self-correct → persist complianceData`. Transient `thumbnailDir` cleanup in `finally`.
+- Handler does not yet persist `SheetRender` rows (renders produced but not DB-registered — deferred to 4c).
+- Tests:
+  - Unit: sidecar client `explore/renderThumbnails/execute`; anthropic client multimodal call shape; handler state machine (cache hit, cache miss, self-correction retry, exhausted-retries failure).
+  - Integration: structural-hash cache hit path (second upload of structurally-similar file ~15s, $0, skips `render-thumbnails`); self-correction retry path (first-attempt crash → second-attempt success); exhausted-retries failure path (both attempts crash → `FAILED` + `extractionError` populated).
+  - Contract test: dot-number invariant — on a fixture DXF, assert `thumbnails[0].dotCount ≤ text_samples.length` for sheet[0] and that the renderer consumes `explorationJson.text_samples` rather than re-enumerating ezdxf.
+- Demo: cold first run ~100–160s at ~$1 with `complianceData` populated; re-upload structurally-similar file ~15s $0 cache hit.
 
 **Phase 4c — SheetRender persistence + client sheet viewer.**
 - Prisma migration: `SheetRender` table + `SheetClassification` enum
@@ -1745,6 +1974,10 @@ Captured so nothing is lost. None block v1.
 19. **Multi-attempt self-correction (>1 retry)** — v1 allows exactly one self-correction attempt. If telemetry shows a meaningful tail of 2-retry successes, raise the cap.
 20. **Script provenance / diffing UI** — admins can view `ExtractionScript` lineage (`fixedFromScriptId` chain) and diff the corrected script vs the broken one. Useful for improving `EXTRACTION_CODEGEN_SYSTEM_PROMPT` based on real failure patterns.
 21. **Cross-architect generalization test suite** — ongoing fixture library of DXFs from different architects, run in CI as a regression gate on any change to the codegen prompt or explorer script. Phase 4c's acceptance test is the seed of this.
+22. **Sonnet 4.6 + vision A/B** — v1 ships codegen on `claude-opus-4-7` for reliability. After Phase 4b accumulates 20–30 cold runs of telemetry (self-correction rate, generation time, cost per cold run), flip half of new cold runs to `claude-sonnet-4-6` + vision by setting `anthropic.generateExtractionScript()`'s model via config. Compare self-correction rate and total-cost-to-green. `ExtractionScript.generatedByModel` already supports the audit cut. Decision criterion: if Sonnet's self-correction rate is within +10% of Opus's, adopt Sonnet as default and Opus as the fix model.
+23. **Transient thumbnail sweeper** — crashed Node processes leave orphan `uploads/tmp/thumbnails/<dxfFileId>/` directories. v1 handler cleans up in `finally`; crash-before-finally is rare but possible. Add an hourly sweeper that removes directories older than 24h. Low priority at v1 scale — a few dozen orphan directories per year are harmless.
+24. **Dot-density cap tuning** — v1 caps at 100 dots/sheet with non-numeric-first prioritization. If telemetry shows Claude asking to reference dot numbers above the cap (via self-correction tracebacks or extraction errors citing missing labels), raise the cap or change the prioritization. Log `dotCount` per sheet from `/render-thumbnails` to enable this analysis.
+25. **Re-export encoding drift** — if an architect re-exports the same DXF from a different AutoCAD version, the `raw` strings may change (e.g. SHX → Unicode). Structural hash changes, new cache entry fetched, new script generated. This is the correct behavior but doubles codegen cost for that architect. If it becomes a meaningful cost driver, consider a "label-map alias" table keyed by (architect, semantic_label) that seeds `LABELS` across structural-hash variations. Defer until real-world data shows this matters.
 
 ---
 
