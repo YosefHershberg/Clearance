@@ -7,7 +7,7 @@ tags:
   - buildcheck
 project: buildcheck
 current_phase: 4b
-current_status: in-progress
+current_status: in-review
 integration_branch: integration/buildcheck
 spec: docs/superpowers/specs/2026-04-19-buildcheck-full-redesign.md
 updated: 2026-04-21
@@ -16,7 +16,7 @@ updated: 2026-04-21
 # BuildCheck — Phase Status
 
 > [!info] Current
-> **Phase 4b — Codegen + execute + self-correct** · status **in-progress** · branch `feat/buildcheck-phase-4b` (sidecar + server + main repo)
+> **Phase 4b — Codegen + execute + self-correct** · status **in-review** · branch `feat/buildcheck-phase-4b` (sidecar + server + main repo) · [Clearance#7](https://github.com/YosefHershberg/Clearance/pull/7) · [sidecar#2](https://github.com/YosefHershberg/Clearance-sidecar/pull/2) · [server#6](https://github.com/YosefHershberg/Clearance-server/pull/6)
 >
 > Phases 1b / 2 / 3 / 4a all **merged** into `integration/buildcheck` on 2026-04-20. Integration tip carries the full post-4a state.
 
@@ -50,7 +50,7 @@ Single source of truth for where the BuildCheck redesign is right now. Check thi
 | 2 | Projects + storage | merged | `feat/buildcheck-phase-2` | [Clearance#4](https://github.com/YosefHershberg/Clearance/pull/4) · [server#3](https://github.com/YosefHershberg/Clearance-server/pull/3) · [client#2](https://github.com/YosefHershberg/Clearance-client/pull/2) | merged 2026-04-20; `StoredFile`, `Project`, local-disk storage, project CRUD, client project pages |
 | 3 | Jobs infrastructure | merged | `feat/buildcheck-phase-3` | [Clearance#5](https://github.com/YosefHershberg/Clearance/pull/5) · [server#4](https://github.com/YosefHershberg/Clearance-server/pull/4) | merged 2026-04-20; `Job`, polling runner + boot-recovery reaper, no handlers yet |
 | 4a | Sidecar + upload + explore | merged | `feat/buildcheck-phase-4a` | [Clearance#6](https://github.com/YosefHershberg/Clearance/pull/6) · [sidecar#1](https://github.com/YosefHershberg/Clearance-sidecar/pull/1) · [server#5](https://github.com/YosefHershberg/Clearance-server/pull/5) · [client#3](https://github.com/YosefHershberg/Clearance-client/pull/3) | merged 2026-04-20; FastAPI sidecar (new submodule), `/explore` only, upload endpoint, per-project sha256 dedup, `DxfFile.explorationJson` + `structuralHash` |
-| 4b | Codegen + execute + self-correct (v3.1 visual bridge) | **in-progress** | `feat/buildcheck-phase-4b` | — | Sidecar `/render-thumbnails` + `/execute`, explorer emits raw+decoded samples, multimodal Opus codegen with thumbnails, `ExtractionScript` cache (global, append-only), state-machine handler, `DxfFile.complianceData` populated; local commits across 3 submodules, not pushed |
+| 4b | Codegen + execute + self-correct (v3.1 visual bridge) | **in-review** | `feat/buildcheck-phase-4b` | [Clearance#7](https://github.com/YosefHershberg/Clearance/pull/7) · [sidecar#2](https://github.com/YosefHershberg/Clearance-sidecar/pull/2) · [server#6](https://github.com/YosefHershberg/Clearance-server/pull/6) | Sidecar `/render-thumbnails` + `/execute`, explorer emits raw+decoded samples, multimodal Opus codegen with thumbnails, `ExtractionScript` cache (global, append-only), state-machine handler, `DxfFile.complianceData` populated; PRs open 2026-04-21 |
 | 4c | SheetRender persistence + client viewer | planned | — | — | `SheetRender` table, SVG serving endpoint, DxfPreview grid + lightbox; cross-architect acceptance test |
 | 5 | TAVA upload + OCR | planned | — | — | pdftotext + tesseract, requirements parse |
 | 6 | Core compliance agent | planned | — | — | `Analysis`, `ComplianceResult`, analyze endpoint, AnalysisPage |
