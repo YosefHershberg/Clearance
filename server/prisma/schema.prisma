@@ -1,0 +1,206 @@
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum UserRole {
+  ADMIN
+  USER
+}
+
+enum FileKind {
+  DXF
+  TAVA
+  ADDON
+  RENDER
+  EXTRACTION_SCRIPT
+}
+
+enum FileStore {
+  LOCAL
+  S3
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  name         String
+  passwordHash String
+  role         UserRole @default(USER)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  projects Project[]
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  actorId   String?
+  event     String
+  entity    String?
+  entityId  String?
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  @@index([actorId, createdAt])
+  @@index([entity, entityId])
+}
+
+model StoredFile {
+  id           String    @id @default(cuid())
+  kind         FileKind
+  store        FileStore @default(LOCAL)
+  uri          String
+  originalName String
+  sizeBytes    Int
+  sha256       String
+  createdAt    DateTime  @default(now())
+
+  dxfFile          DxfFile?
+  extractionScript ExtractionScript?
+  sheetRender      SheetRender?
+
+  @@index([sha256])
+}
+
+model Project {
+  id          String    @id @default(cuid())
+  ownerId     String
+  owner       User      @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  locality    String?
+  deletedAt   DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  dxfFiles DxfFile[]
+
+  @@index([ownerId, createdAt])
+  @@index([deletedAt])
+}
+
+enum ExtractionStatus {
+  PENDING
+  EXTRACTING
+  COMPLETED
+  FAILED
+}
+
+enum SheetClassification {
+  INDEX_PAGE
+  FLOOR_PLAN
+  CROSS_SECTION
+  ELEVATION
+  PARKING_SECTION
+  SURVEY
+  SITE_PLAN
+  ROOF_PLAN
+  AREA_CALCULATION
+  UNCLASSIFIED
+}
+
+model DxfFile {
+  id           String     @id @default(cuid())
+  projectId    String
+  project      Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  storedFileId String     @unique
+  storedFile   StoredFile @relation(fields: [storedFileId], references: [id])
+
+  extractionStatus ExtractionStatus @default(PENDING)
+  extractionError  String?
+  extractionJobId  String?
+
+  explorationJson Json?
+  structuralHash  String?
+  complianceData  Json?
+  extractionTrace Json?
+
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  sheetRenders SheetRender[]
+
+  @@index([projectId, createdAt])
+  @@index([structuralHash])
+}
+
+model ExtractionScript {
+  id             String     @id @default(cuid())
+  structuralHash String
+  storedFileId   String     @unique
+  storedFile     StoredFile @relation(fields: [storedFileId], references: [id])
+
+  generatedByModel  String
+  generationCostUsd Decimal  @db.Decimal(10, 4)
+  generationMs      Int
+  fixedFromScriptId String?
+  createdAt         DateTime @default(now())
+
+  @@index([structuralHash, createdAt])
+}
+
+model SheetRender {
+  id           String              @id @default(cuid())
+  dxfFileId    String
+  dxfFile      DxfFile             @relation(fields: [dxfFileId], references: [id], onDelete: Cascade)
+  storedFileId String              @unique
+  storedFile   StoredFile          @relation(fields: [storedFileId], references: [id])
+
+  sheetIndex      Int
+  displayName     String
+  classification  SheetClassification @default(UNCLASSIFIED)
+  geometryBlock   String?
+  annotationBlock String?
+  svgWarning      String?
+  createdAt       DateTime            @default(now())
+
+  @@unique([dxfFileId, sheetIndex])
+  @@index([dxfFileId, classification])
+}
+
+enum JobType {
+  DXF_EXTRACTION
+  TAVA_EXTRACTION
+  ADDON_EXTRACTION
+  CORE_ANALYSIS
+  ADDON_RUN
+}
+
+enum JobStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+model Job {
+  id           String    @id @default(cuid())
+  type         JobType
+  status       JobStatus @default(PENDING)
+  payload      Json
+  errorMessage String?
+  attempts     Int       @default(0)
+  heartbeatAt  DateTime?
+
+  projectId       String?
+  analysisId      String?
+  addonRunId      String?
+  dxfFileId       String?
+  tavaFileId      String?
+  addonDocumentId String?
+
+  startedAt   DateTime?
+  completedAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([status, createdAt])
+  @@index([type, status])
+}

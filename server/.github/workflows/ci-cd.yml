@@ -1,0 +1,150 @@
+name: Server CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20.x]
+    env:
+      # Placeholder values so env.ts Zod validation passes at module load.
+      # Unit tests mock actual SDK / auth / admin behavior; these do not need to be real.
+      PORT: '3001'
+      DATABASE_URL: postgresql://dummy:dummy@localhost:5432/dummy
+      DIRECT_URL: postgresql://dummy:dummy@localhost:5432/dummy
+      CORS_ORIGIN: http://localhost:5173
+      JWT_SECRET: ci-placeholder-jwt-secret-at-least-32-chars-long
+      ADMIN_EMAIL: ci@example.com
+      ADMIN_INITIAL_PASSWORD: ci-placeholder-password
+      ANTHROPIC_API_KEY: sk-ant-ci-placeholder-value
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - run: npm ci
+      - name: Generate Prisma client
+        run: npx prisma generate
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+      - name: Upload build artifacts
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-build
+          path: |
+            dist
+            src/generated
+            prisma
+            package.json
+            package-lock.json
+          retention-days: 1
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    env:
+      # Placeholder values so env.ts Zod validation passes at module load.
+      # DATABASE_URL/DIRECT_URL point at the CI Postgres service; others are
+      # placeholders because integration tests don't exercise JWT/admin-seeding
+      # code paths that require real values.
+      PORT: '3001'
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test
+      DIRECT_URL: postgresql://postgres:postgres@localhost:5432/test
+      CORS_ORIGIN: http://localhost:5173
+      JWT_SECRET: ci-placeholder-jwt-secret-at-least-32-chars-long
+      ADMIN_EMAIL: ci@example.com
+      ADMIN_INITIAL_PASSWORD: ci-placeholder-password
+      ANTHROPIC_API_KEY: sk-ant-ci-placeholder-value
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: npm
+      - run: npm ci
+      - name: Generate Prisma client
+        run: npx prisma generate
+      - name: Apply migrations
+        run: npx prisma migrate deploy
+      - run: npm run test:integration
+
+  docker:
+    name: Build & push Docker image
+    if: github.event_name == 'push'
+    needs: [test, integration]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js 20.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: npm
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: server-build
+
+      - name: Install production dependencies
+        run: npm ci --omit=dev
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/clearance-server
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

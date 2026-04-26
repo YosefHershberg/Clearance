@@ -1,0 +1,26 @@
+# Per-Dockerfile ignore for Dockerfile.dev (BuildKit honors <dockerfile>.dockerignore).
+# The dev image builds FROM SOURCE inside the container, so unlike the prod
+# .dockerignore (which excludes tsconfig.json / src etc.), this one keeps
+# source files — but still prunes the usual junk.
+
+node_modules
+dist
+src/generated
+coverage
+logs
+.env
+.env.*
+!.env.example
+.git
+.github
+.vscode
+.idea
+src/**/*.test.ts
+src/**/*.spec.ts
+jest.integration.config.js
+README.md
+CLAUDE.md
+.claude
+nodemon.json
+Dockerfile
+.dockerignore

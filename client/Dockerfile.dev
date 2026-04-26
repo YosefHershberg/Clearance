@@ -1,0 +1,19 @@
+# syntax=docker/dockerfile:1.7
+#
+# Dev-oriented image that runs Vite's dev server (with HMR). For local
+# acceptance testing via the root docker-compose.yml. Production CI uses the
+# thin `Dockerfile` next to this one.
+
+FROM node:20-bookworm-slim
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci
+
+COPY . ./
+
+EXPOSE 5173
+
+# --host 0.0.0.0 makes the port reachable from the host through the port map.
+CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
