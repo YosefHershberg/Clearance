@@ -1,0 +1,193 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/rubik";
+
+/* Class-based dark mode — toggled via .dark on <html> */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Expose design tokens as Tailwind utilities */
+@theme inline {
+  --font-sans: 'Rubik Variable', 'Rubik', sans-serif;
+  --font-mono: var(--mono);
+  --font-heading: var(--font-sans);
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+
+  /* Functional status colors — additions for BuildCheck compliance UI */
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+/* Light mode — BuildCheck "Authority & Precision"
+   Coral primary on slate neutrals, Hebrew RTL, compliance-tool density. */
+:root {
+  --sans: 'Rubik Variable', 'Rubik', sans-serif;
+  --mono: ui-monospace, Consolas, monospace;
+
+  /* Page surface = #F8FAFC (section bg), raised surface = white */
+  --background: #f8fafc;
+  --foreground: #1e293b;
+  --card: #ffffff;
+  --card-foreground: #1e293b;
+  --popover: #ffffff;
+  --popover-foreground: #1e293b;
+
+  /* Primary = coral, used sparingly. Secondary = slate. */
+  --primary: #ff7f50;
+  --primary-foreground: #ffffff;
+  --secondary: #475569;
+  --secondary-foreground: #ffffff;
+  --muted: #f1f5f9;
+  --muted-foreground: #64748b;
+  --accent: #f1f5f9;
+  --accent-foreground: #1e293b;
+  --destructive: #c94a4a;
+
+  /* Functional status */
+  --success: #3f9d6e;
+  --success-foreground: #ffffff;
+  --warning: #d4a03b;
+  --warning-foreground: #ffffff;
+
+  --border: #e2e8f0;
+  --input: #e2e8f0;
+  --ring: #475569;
+
+  /* Charts — slate scale (compliance tool has no data viz in v1) */
+  --chart-1: #cbd5e1;
+  --chart-2: #94a3b8;
+  --chart-3: #64748b;
+  --chart-4: #475569;
+  --chart-5: #1e293b;
+
+  /* 8px baseline — Stitch's rounded-lg across buttons/cards/inputs */
+  --radius: 0.5rem;
+
+  /* Sidebar (kept for shadcn compat; tuned to system) */
+  --sidebar: #f8fafc;
+  --sidebar-foreground: #1e293b;
+  --sidebar-primary: #ff7f50;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #f1f5f9;
+  --sidebar-accent-foreground: #1e293b;
+  --sidebar-border: #e2e8f0;
+  --sidebar-ring: #475569;
+}
+
+/* Dark mode — slate-900/950 neutrals, coral primary preserved */
+.dark {
+  --background: #0f172a;
+  --foreground: #f1f5f9;
+  --card: #1e293b;
+  --card-foreground: #f1f5f9;
+  --popover: #1e293b;
+  --popover-foreground: #f1f5f9;
+
+  --primary: #ff7f50;
+  --primary-foreground: #1e293b;
+  --secondary: #334155;
+  --secondary-foreground: #f1f5f9;
+  --muted: #1e293b;
+  --muted-foreground: #94a3b8;
+  --accent: #1e293b;
+  --accent-foreground: #f1f5f9;
+  --destructive: #dc6a6a;
+
+  --success: #4fb082;
+  --success-foreground: #052e1a;
+  --warning: #e5b25a;
+  --warning-foreground: #3a2a0a;
+
+  --border: color-mix(in oklab, white 12%, transparent);
+  --input: color-mix(in oklab, white 15%, transparent);
+  --ring: #94a3b8;
+
+  --chart-1: #475569;
+  --chart-2: #64748b;
+  --chart-3: #94a3b8;
+  --chart-4: #cbd5e1;
+  --chart-5: #f1f5f9;
+
+  --sidebar: #0f172a;
+  --sidebar-foreground: #f1f5f9;
+  --sidebar-primary: #ff7f50;
+  --sidebar-primary-foreground: #1e293b;
+  --sidebar-accent: #1e293b;
+  --sidebar-accent-foreground: #f1f5f9;
+  --sidebar-border: color-mix(in oklab, white 12%, transparent);
+  --sidebar-ring: #94a3b8;
+}
+
+@layer base {
+  body {
+    margin: 0;
+    font-family: var(--sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    @apply bg-background text-foreground;
+  }
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    @apply font-sans;
+  }
+}
+
+@layer utilities {
+  /* Typography: label-caps — used for table headers, metadata labels, badges.
+     Matches the Stitch "Authority & Precision" spec. */
+  .label-caps {
+    font-size: 0.6875rem;
+    font-weight: 600;
+    line-height: 1;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--secondary);
+  }
+}

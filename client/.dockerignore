@@ -1,0 +1,31 @@
+# Only dist/ and nginx.conf are needed in the Docker build context.
+# Everything else is excluded to keep the context small.
+
+node_modules
+coverage
+.env
+.env.*
+!.env.example
+.git
+.github
+.vscode
+.idea
+src
+public
+index.html
+vite.config.ts
+vite.config.js
+tsconfig.json
+tsconfig.node.json
+tsconfig.app.json
+eslint.config.js
+playwright.config.ts
+playwright-report
+test-results
+README.md
+CLAUDE.md
+.claude
+package.json
+package-lock.json
+Dockerfile
+.dockerignore

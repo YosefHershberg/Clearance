@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1.7
+#
+# Dev-oriented image that does the full install + build INSIDE the container.
+# For local acceptance testing via the root docker-compose.yml. Production CI
+# uses the thin `Dockerfile` next to this one.
+
+FROM node:20-bookworm-slim
+
+WORKDIR /app
+
+# Prisma's query engine needs openssl + ca-certificates on debian slim.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY package*.json ./
+COPY prisma ./prisma
+COPY prisma.config.ts ./
+RUN npm ci
+
+# prisma.config.ts calls env("DIRECT_URL") at LOAD time (strict — throws on
+# missing). `prisma generate` and `tsc` don't actually need a working DB, so
+# set placeholder URLs for the build. Runtime values come from env_file.
+ENV DIRECT_URL=postgresql://placeholder:placeholder@localhost:5432/placeholder
+ENV DATABASE_URL=postgresql://placeholder:placeholder@localhost:5432/placeholder
+
+COPY tsconfig.json ./
+COPY src ./src
+
+RUN npx prisma generate
+RUN npm run build
+
+EXPOSE 3001
+
+# Apply pending migrations (idempotent) then start the server.
+CMD ["sh", "-c", "npx prisma migrate deploy && node dist/src/index.js"]

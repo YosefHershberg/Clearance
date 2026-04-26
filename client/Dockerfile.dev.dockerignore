@@ -1,0 +1,23 @@
+# Per-Dockerfile ignore for Dockerfile.dev (BuildKit honors <dockerfile>.dockerignore).
+# The dev image runs the Vite dev server with source mounted via COPY, so unlike
+# the prod .dockerignore (which keeps only dist/ + nginx.conf), this one keeps
+# source files.
+
+node_modules
+dist
+coverage
+.env
+.env.*
+!.env.development
+!.env.example
+.git
+.github
+.vscode
+.idea
+playwright-report
+test-results
+README.md
+CLAUDE.md
+.claude
+Dockerfile
+.dockerignore

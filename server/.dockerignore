@@ -1,0 +1,24 @@
+# Everything the Dockerfile does NOT need in its build context.
+# Note: dist/, node_modules/, src/generated/, prisma/, package.json
+# are intentionally NOT ignored — the runner builds them before `docker build`.
+
+logs
+coverage
+.env
+.env.*
+!.env.example
+.git
+.github
+.vscode
+.idea
+src/**/*.test.ts
+src/**/*.spec.ts
+jest.integration.config.js
+README.md
+CLAUDE.md
+.claude
+tsconfig.json
+prisma.config.ts
+nodemon.json
+Dockerfile
+.dockerignore
