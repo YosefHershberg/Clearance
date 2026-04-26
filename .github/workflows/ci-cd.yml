@@ -1,0 +1,291 @@
+name: CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+jobs:
+  client-test:
+    name: client · test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run build
+
+      - name: Upload client build
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-build
+          path: client/dist
+          retention-days: 1
+
+  server-test:
+    name: server · test (unit)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    env:
+      # Placeholder values so env.ts Zod validation passes at module load.
+      # Unit tests mock SDK / auth / admin behavior; these do not need to be real.
+      PORT: '3001'
+      DATABASE_URL: postgresql://dummy:dummy@localhost:5432/dummy
+      DIRECT_URL: postgresql://dummy:dummy@localhost:5432/dummy
+      CORS_ORIGIN: http://localhost:5173
+      JWT_SECRET: ci-placeholder-jwt-secret-at-least-32-chars-long
+      ADMIN_EMAIL: ci@example.com
+      ADMIN_INITIAL_PASSWORD: ci-placeholder-password
+      ANTHROPIC_API_KEY: sk-ant-ci-placeholder-value
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - run: npm ci
+      - name: Generate Prisma client
+        run: npx prisma generate
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+      - name: Upload server build
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-build
+          path: |
+            server/dist
+            server/src/generated
+            server/prisma
+            server/package.json
+            server/package-lock.json
+          retention-days: 1
+
+  server-integration:
+    name: server · integration
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    env:
+      PORT: '3001'
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test
+      DIRECT_URL: postgresql://postgres:postgres@localhost:5432/test
+      CORS_ORIGIN: http://localhost:5173
+      JWT_SECRET: ci-placeholder-jwt-secret-at-least-32-chars-long
+      ADMIN_EMAIL: ci@example.com
+      ADMIN_INITIAL_PASSWORD: ci-placeholder-password
+      ANTHROPIC_API_KEY: sk-ant-ci-placeholder-value
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - run: npm ci
+      - name: Generate Prisma client
+        run: npx prisma generate
+      - name: Apply migrations
+        run: npx prisma migrate deploy
+      - run: npm run test:integration
+
+  sidecar-test:
+    name: sidecar · test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sidecar
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: sidecar/requirements-dev.txt
+
+      - run: python -m pip install -U pip
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+      - run: pytest -q
+
+  client-image:
+    name: client · build & push image
+    if: github.event_name == 'push'
+    needs: client-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download client build
+        uses: actions/download-artifact@v4
+        with:
+          name: client-build
+          path: client/dist
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/clearance-client
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ./client
+          file: ./client/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=client
+          cache-to: type=gha,mode=max,scope=client
+
+  server-image:
+    name: server · build & push image
+    if: github.event_name == 'push'
+    needs: [server-test, server-integration]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Download server build
+        uses: actions/download-artifact@v4
+        with:
+          name: server-build
+          # Artifact was uploaded with server/ prefix; default extracts to repo root.
+
+      - name: Install production dependencies
+        run: npm ci --omit=dev
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/clearance-server
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ./server
+          file: ./server/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=server
+          cache-to: type=gha,mode=max,scope=server
+
+  sidecar-image:
+    name: sidecar · build & push image
+    if: github.event_name == 'push'
+    needs: sidecar-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/clearance-sidecar
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ./sidecar
+          file: ./sidecar/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=sidecar
+          cache-to: type=gha,mode=max,scope=sidecar
