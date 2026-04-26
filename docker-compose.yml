@@ -1,0 +1,83 @@
+# Local acceptance-test stack for BuildCheck.
+#
+# Runs all three services (sidecar + server + client) with a shared host-mounted
+# uploads directory so the DXF → explore → codegen → execute → render pipeline
+# round-trips end-to-end.
+#
+# Prerequisites:
+#   1. server/.env is populated with all required vars (see server/.env.example).
+#      In particular: DATABASE_URL, DIRECT_URL, JWT_SECRET (32+ chars),
+#      ADMIN_EMAIL, ADMIN_INITIAL_PASSWORD, ANTHROPIC_API_KEY.
+#   2. ./uploads/ is writable on the host (bind-mounted into server + sidecar).
+#
+# Usage:
+#   docker compose up --build           # first run, or after any code change
+#   docker compose up                   # subsequent runs (reuses built images)
+#   docker compose down                 # stop all three
+#
+# Port map:
+#   http://localhost:5173  — client (Vite dev server, HMR on)
+#   http://localhost:3001  — server API
+#   http://localhost:3002  — sidecar (internal, but exposed for debugging)
+#
+# DB: uses whatever DATABASE_URL points at in server/.env (typically Supabase).
+# The server runs `prisma migrate deploy` on startup so new migrations apply.
+
+services:
+  sidecar:
+    build:
+      context: ./sidecar
+    # Dev-only: run as root so the sidecar can write under /data/uploads
+    # subdirs created by the server (which also runs as root in dev). The
+    # production sidecar image keeps `USER app` via its Dockerfile.
+    user: "0:0"
+    ports:
+      - "3002:3002"
+    volumes:
+      - ./uploads:/data/uploads
+    environment:
+      UPLOADS_PARENT_DIR: /data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:3002/health').read()"
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile.dev
+    ports:
+      - "3001:3001"
+    env_file:
+      - ./server/.env
+    environment:
+      # Override a few env.ts values for the dockerized case.
+      PYTHON_SIDECAR_URL: http://sidecar:3002
+      UPLOADS_DIR: uploads
+      CORS_ORIGIN: http://localhost:5173
+      NODE_ENV: development
+    volumes:
+      - ./uploads:/app/uploads
+    depends_on:
+      sidecar:
+        condition: service_healthy
+    restart: unless-stopped
+
+  client:
+    build:
+      context: ./client
+      dockerfile: Dockerfile.dev
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_BASE_URL: http://localhost:3001/api
+    depends_on:
+      - server
+    restart: unless-stopped

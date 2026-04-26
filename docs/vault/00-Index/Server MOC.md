@@ -37,3 +37,7 @@ Node + Express 5 + TypeScript. Postgres via Prisma 7 (PrismaPg adapter). Auth no
 - [[HttpError]] — typed HTTP error
 - [[env]] — Zod-validated environment variables
 - [[HTTP Types]] — shared response shapes
+
+## Shipping
+- [[Build and Deploy#CI/CD|CI/CD pipeline]] — `test → integration → docker` workflow, pushes to `yosefhershberg/clearance-server`
+- [[Build and Deploy#Branch protection (`Clearance-server` → `main`)|Branch protection]] — required checks on `main`

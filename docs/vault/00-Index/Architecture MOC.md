@@ -11,6 +11,6 @@ tags:
 - [[System Overview]] — top-level picture
 - [[Client-Server Boundary]] — how the two submodules talk
 - [[Request Lifecycle]] — middleware chain on the server
-- [[Build and Deploy]] — scripts, build outputs, env
+- [[Build and Deploy]] — scripts, Dockerfiles, CI/CD, Docker Hub images, env
 
 Related: [[Client MOC]] · [[Server MOC]] · [[API MOC]]
