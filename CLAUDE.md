@@ -7,10 +7,17 @@ Full-stack monorepo:
 - `sidecar/` — Python sidecar (FastAPI) for the DXF/PDF pipeline
 
 ## Conventions
-- All PRs require at least 1 review and passing CI before merge
 - Use conventional commits: feat:, fix:, chore:, docs:
 - Never commit secrets or .env files
 - settings.local.json is gitignored (personal Claude overrides only)
+
+### `main` branch protection (enforced on GitHub, including admins)
+- Direct pushes to `main` are blocked — all changes ship via PR.
+- Required status checks (must pass and branch must be up-to-date with `main`): `client · test`, `server · test (unit)`, `server · integration`, `sidecar · test`.
+- Linear history required — use squash or rebase merges; merge commits are rejected.
+- Force pushes and branch deletion are blocked.
+- All PR conversations must be resolved before merge.
+- **Approving reviews are not yet required** because the repo currently has a single collaborator (GitHub disallows self-approval). When a second reviewer is added, flip `required_approving_review_count` to `1` (and consider `dismiss_stale_reviews: true`) on the `main` protection rule.
 
 ## Running and validating the dev stack
 `DEVELOPMENT.md` (repo root) is the agent's operational guide for the local stack — read it before:
