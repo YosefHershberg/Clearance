@@ -8,9 +8,8 @@ tags:
 project: buildcheck
 current_phase: 5
 current_status: not-started
-integration_branch: integration/buildcheck
 spec: docs/superpowers/specs/2026-04-19-buildcheck-full-redesign.md
-updated: 2026-04-23
+updated: 2026-04-26
 ---
 
 # BuildCheck — Phase Status
@@ -18,7 +17,7 @@ updated: 2026-04-23
 > [!info] Current
 > **Phase 5 — TAVA upload + OCR** · status **not-started** · branch *(to create)* `feat/buildcheck-phase-5`
 >
-> Phase 4c merged into `integration/buildcheck` on 2026-04-23. Phases 1b / 2 / 3 / 4a / 4b / 4c all merged. Integration tip carries the full DXF pipeline end-to-end: explore → cache/codegen → execute → persist → client sheet viewer (grid + lightbox, Hebrew RTL, classification badges).
+> v1 shipped to `main` on 2026-04-26 (PR #13 merged `integration/buildcheck` → `main`; PRs #14–#17 followed with submodule inlining, monorepo CI/CD, CI fixes, and protection docs). Phases 0 → 4c plus the design-system port are live on `main`. `main` carries the full DXF pipeline end-to-end: explore → cache/codegen → execute → persist → client sheet viewer (grid + lightbox, Hebrew RTL, classification badges).
 
 > [!note] 2026-04-21 — Phase 4b scope refined (v3.1 visual-bridge)
 > Spec revised to v3.1: codegen becomes multimodal (`explorationJson + thumbnails[]`), explorer emits byte-exact `raw` samples alongside `decoded`, new sidecar endpoint `POST /render-thumbnails` with `dxf_sheet_renderer.py` (numbered-dots-per-text-position bridge), `EXTRACTION_CODEGEN_SYSTEM_PROMPT` shrinks (no Hebrew keyword table, no dual-viewport heuristic). Phase numbering unchanged; Phase 4b scope expanded — see spec §13 and the 2026-04-21 revision note.
@@ -29,16 +28,14 @@ updated: 2026-04-23
 Single source of truth for where the BuildCheck redesign is right now. Check this before starting work; update it whenever a phase transitions.
 
 - Spec: [[../10-Architecture/BuildCheck Redesign Spec|Full redesign spec]] — phase breakdown in §13 (or open [spec file](../../superpowers/specs/2026-04-19-buildcheck-full-redesign.md) directly)
-- Integration branch: `integration/buildcheck` (long-lived, off `main`)
-- Per-phase PRs target the integration branch; a single final PR merges integration → main at v1
+- Branch workflow: see CLAUDE.md "Branch workflow" (long form: [`docs/superpowers/specs/2026-04-26-git-branch-workflow-design.md`](../../superpowers/specs/2026-04-26-git-branch-workflow-design.md)). Each phase ships as a single `feat/buildcheck-phase-N` PR straight to `main`.
 
 ## Status values
 
 - `not-started` — next up, no branch yet
-- `in-progress` — branch exists, commits landing
-- `in-review` — PR open against `integration/buildcheck`
-- `merged` — PR merged into integration
-- `shipped` — only for the final `integration/buildcheck → main` merge
+- `in-progress` — branch + draft PR exist, commits landing
+- `in-review` — PR converted to ready-for-review on `main`
+- `merged` — PR squash- or rebase-merged into `main`, branch deleted
 
 ## Phase log
 
