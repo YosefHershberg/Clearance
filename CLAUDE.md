@@ -11,6 +11,13 @@ This is a full-stack app split into two submodules:
 - Never commit secrets or .env files
 - settings.local.json is gitignored (personal Claude overrides only)
 
+## Running and validating the dev stack
+`DEVELOPMENT.md` (repo root) is the agent's operational guide for the local stack — read it before:
+- Running the dev servers (`docker compose` flow, detached + background log tail — never foreground `up`).
+- Debugging via logs (`docker compose logs -f` patterns, `server/logs/*.log` files).
+- Validating client/UI changes end-to-end via the Claude in Chrome MCP tools against `http://localhost:5173`.
+- Reproducing pipeline issues with `dummy_data/` fixtures.
+
 ## Knowledge Vault
 An Obsidian knowledge graph lives at `docs/vault/`. Use it as the first stop for architecture, request lifecycle, API index, and end-to-end flows — it's kept in sync with the code and structured for cross-linking.
 
